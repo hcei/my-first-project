@@ -5,6 +5,7 @@
 //      2) 蘸墨：两次蘸→十字抖→离液面上下抖5次（上慢下快）
 //      3) ★新增位姿跟踪：全局记录“最后已知位置”，为首字“到位→等待→落笔”做准备
 //      4) ★修复：批量7点成功后位姿更新用 pts7.back()
+//      5) ★修复：急停线程常驻、仅ESC触发且不窃取按键；Z越界校验含Z_OFFSET；蘸墨逐点速度生效
 
 #define NOMINMAX
 #include <windows.h>
@@ -329,11 +330,14 @@ public:
     }
 
     bool sendPoint(const Point& p) {
-        if (!inZRange(p.z) || !inXYRange(p.x, p.y, g_devLimit)) {
-            std::wstringstream ws; ws << L"[错误] 点越界 X=" << p.x << L" Y=" << p.y << L" Z=" << p.z;
+        // ★修复：Z 越界校验包含 Z_OFFSET（此前校验原始 z，实际发送 z+偏移，偏移过大时校验失效）
+        if (!inZRange(p.z + Z_OFFSET) || !inXYRange(p.x, p.y, g_devLimit)) {
+            std::wstringstream ws; ws << L"[错误] 点越界 X=" << p.x << L" Y=" << p.y << L" Z=" << (p.z + Z_OFFSET);
             wprintln(ws.str()); return false;
         }
-        uint8_t speedHigh = (uint8_t)std::max(0, std::min(9, SPEED_LEVEL - 1));
+        // ★修复：优先使用点自带的速度档 p.speed（1~6），蘸墨的"上慢下快"才能生效
+        int lvl = (p.speed >= 1 && p.speed <= (uint8_t)SPEED_MAX) ? (int)p.speed : SPEED_LEVEL;
+        uint8_t speedHigh = (uint8_t)std::max(0, std::min(9, lvl - 1));
         uint8_t suctionLow = 0x00;
         uint16_t vReg = (uint16_t(speedHigh) << 8) | suctionLow;
 
@@ -401,7 +405,9 @@ public:
         int16_t y10 = mm_to_dev10(p.y);
         int16_t z10 = mm_to_dev10(p.z + Z_OFFSET);
         int16_t a10 = 0;
-        uint8_t speedHigh = (uint8_t)std::max(0, std::min(9, SPEED_LEVEL - 1));
+        // ★修复：同 sendPoint，优先使用点自带速度档
+        int lvl = (p.speed >= 1 && p.speed <= (uint8_t)SPEED_MAX) ? (int)p.speed : SPEED_LEVEL;
+        uint8_t speedHigh = (uint8_t)std::max(0, std::min(9, lvl - 1));
         uint8_t suctionLow = 0x00;
         int16_t v10 = (int16_t)((uint16_t(speedHigh) << 8) | suctionLow);
         out5[0] = x10; out5[1] = y10; out5[2] = z10; out5[3] = a10; out5[4] = v10;
@@ -411,7 +417,8 @@ public:
         if (pts7.empty()) return true;
         size_t n = std::min<size_t>(pts7.size(), 7);
         for (size_t i = 0; i < n; ++i) {
-            if (!inZRange(pts7[i].z) || !inXYRange(pts7[i].x, pts7[i].y, g_devLimit)) {
+            // ★修复：Z 校验同样包含 Z_OFFSET
+            if (!inZRange(pts7[i].z + Z_OFFSET) || !inXYRange(pts7[i].x, pts7[i].y, g_devLimit)) {
                 std::wstringstream ws; ws << L"[错误] 批量点越界 #" << i << L" X=" << pts7[i].x << L" Y=" << pts7[i].y << L" Z=" << (pts7[i].z + Z_OFFSET);
                 wprintln(ws.str()); return false;
             }
@@ -1307,11 +1314,28 @@ static void print_menu() {
 }
 
 // --------------------------- 急停线程 ---------------------------
+// ★修复：1) 线程常驻循环（此前触发一次即 return，导致第二次急停失效）
+//        2) 用 PeekConsoleInput 探测，不再 _getch 窃取普通按键（避免菜单/文字输入丢字）
+//        3) 仅 ESC 触发急停（移除空格：输入诗句时空格常见，易误触）
+//        4) 触发后清空输入缓冲，防止同一 ESC 事件反复置位
 static void estop_poll() {
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
     while (true) {
-        if (_kbhit()) {
-            int ch = _getch();
-            if (ch == 27 || ch == 32) { g_estop = true; return; } // ESC 或 空格 急停
+        DWORD n = 0;
+        if (GetNumberOfConsoleInputEvents(hIn, &n) && n > 0) {
+            std::vector<INPUT_RECORD> recs(n);
+            DWORD rd = 0;
+            if (PeekConsoleInputW(hIn, recs.data(), n, &rd) && rd > 0) {
+                for (DWORD i = 0; i < rd; ++i) {
+                    if (recs[i].EventType == KEY_EVENT &&
+                        recs[i].Event.KeyEvent.bKeyDown &&
+                        recs[i].Event.KeyEvent.wVirtualKeyCode == VK_ESCAPE) {
+                        g_estop = true;
+                        FlushConsoleInputBuffer(hIn);
+                        break;
+                    }
+                }
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
