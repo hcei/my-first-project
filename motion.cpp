@@ -16,17 +16,21 @@ static float RESAMPLE_STEP_MM_CALLI = 0.6f;
 static float RESAMPLE_STEP_MM_DRAW = 1.2f;
 
 // --------------------------- 过滤与降采样 ---------------------------
-std::vector<Point> filterDuplicatePoints(const std::vector<Point>& in) {
+// ★修复：书法区（原下标 < calli_end_src）去重间距由 1.5mm 收紧为 0.3mm——
+//        0.6mm 重采样只能删点不能加点，若先用 1.5mm 去重，密集笔迹会永久丢失细节。
+std::vector<Point> filterDuplicatePoints(const std::vector<Point>& in, std::vector<size_t>* srcIndex, size_t calli_end_src) {
     std::vector<Point> out; out.reserve(in.size());
+    if (srcIndex) srcIndex->clear();
     auto nearEq = [](float a, float b, float eps) { return std::fabs(a - b) <= eps; };
     for (size_t i = 0; i < in.size(); ++i) {
-        if (out.empty()) { out.push_back(in[i]); continue; }
+        if (out.empty()) { out.push_back(in[i]); if (srcIndex) srcIndex->push_back(i); continue; }
         const Point& prev = out.back();
-        float xyEps = 1.5f;
+        float xyEps = (i < calli_end_src) ? 0.3f : 1.5f;
         float zEps = in[i].isPenDown ? 0.6f : 1.5f;
         if (nearEq(prev.x, in[i].x, xyEps) && nearEq(prev.y, in[i].y, xyEps) && nearEq(prev.z, in[i].z, zEps)
             && prev.isPenDown == in[i].isPenDown && prev.speed == in[i].speed) continue;
         out.push_back(in[i]);
+        if (srcIndex) srcIndex->push_back(i);
     }
     return out;
 }
@@ -108,12 +112,13 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
 {
     if (traj.empty()) return true;
 
-    // 去重（防止重复点）
-    std::vector<Point> filtered = filterDuplicatePoints(traj);
+    // 去重（防止重复点）；srcIdx 记录保留点的原下标，供书法/描边分界映射
+    std::vector<size_t> srcIdx;
+    std::vector<Point> filtered = filterDuplicatePoints(traj, &srcIdx, calli_end);
 
-    // 按段降采样：书法更密、描边稍稀
-    auto resample_range = [&](size_t beg, size_t end, float step) {
-        if (end <= beg) return;
+    // 按段降采样：书法更密、描边稍稀（返回替换后该段的新点数，供修正分界）
+    auto resample_range = [&](size_t beg, size_t end, float step) -> size_t {
+        if (end <= beg) return 0;
         size_t i = beg;
         std::vector<Point> out; out.reserve(end - beg + 16);
         while (i < end) {
@@ -127,10 +132,15 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
         }
         filtered.erase(filtered.begin() + beg, filtered.begin() + end);
         filtered.insert(filtered.begin() + beg, out.begin(), out.end());
+        return out.size();
         };
 
+    // ★修复：calli_end 是调用方按“原轨迹”给出的分界，去重和重采样都会改变点数——
+    //        先用 srcIdx 映射到去重后的下标，再在书法段重采样后用返回值更新，
+    //        否则混合轨迹（前段书法+后段描边）会发生分界错位。
+    calli_end = (size_t)(std::lower_bound(srcIdx.begin(), srcIdx.end(), calli_end) - srcIdx.begin());
     calli_end = std::min(calli_end, filtered.size());
-    if (calli_end > 0) resample_range(0, calli_end, 0.6f);   // RESAMPLE_STEP_MM_CALLI（已定义为 0.6）
+    if (calli_end > 0) calli_end = resample_range(0, calli_end, 0.6f);   // RESAMPLE_STEP_MM_CALLI（已定义为 0.6）
     if (calli_end < filtered.size()) resample_range(calli_end, filtered.size(), 1.2f); // RESAMPLE_STEP_MM_DRAW（1.2）
 
     const float corner_theta_rad = 75.0f * 3.1415926f / 180.0f;

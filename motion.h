@@ -5,7 +5,11 @@
 
 class SerialPort; // 前置声明
 
-std::vector<Point> filterDuplicatePoints(const std::vector<Point>& in);
+// 重复点过滤。srcIndex 非空时输出各保留点在原轨迹中的下标（供分界映射）；
+// calli_end_src 为原轨迹中书法段边界：原下标 < calli_end_src 的点用书法细间距去重。
+std::vector<Point> filterDuplicatePoints(const std::vector<Point>& in,
+                                         std::vector<size_t>* srcIndex = nullptr,
+                                         size_t calli_end_src = 0);
 void resamplePolyline(std::vector<Point>& pts, float minStep);
 
 // —— 节奏估时 —— //
