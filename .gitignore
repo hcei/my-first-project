@@ -1,0 +1,13 @@
+# 构建产物
+x64/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.log
+*.recipe
+
+# 测试临时文件
+_test_*
