@@ -131,10 +131,20 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="Robot.cpp" />
+    <ClCompile Include="robot_common.cpp" />
+    <ClCompile Include="serial_port.cpp" />
+    <ClCompile Include="motion.cpp" />
+    <ClCompile Include="hanzi.cpp" />
+    <ClCompile Include="polyline.cpp" />
+    <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="shanshui_gen.hpp" />
+    <ClInclude Include="robot_common.h" />
+    <ClInclude Include="serial_port.h" />
+    <ClInclude Include="motion.h" />
+    <ClInclude Include="hanzi.h" />
+    <ClInclude Include="polyline.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
