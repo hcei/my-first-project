@@ -136,6 +136,7 @@
     <ClCompile Include="motion.cpp" />
     <ClCompile Include="hanzi.cpp" />
     <ClCompile Include="polyline.cpp" />
+    <ClCompile Include="gui_service.cpp" />
     <ClCompile Include="main.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -145,6 +146,7 @@
     <ClInclude Include="motion.h" />
     <ClInclude Include="hanzi.h" />
     <ClInclude Include="polyline.h" />
+    <ClInclude Include="gui_service.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

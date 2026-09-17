@@ -2,7 +2,11 @@
 // 由 Robot.cpp（单文件版）拆分而来；初值与实现逐行保真。
 #include "robot_common.h"
 
+#include <chrono>
+#include <cstdio>
 #include <cwctype>
+#include <direct.h>
+#include <ctime>
 #include <iostream>
 #include <sstream>
 
@@ -13,11 +17,22 @@ float TEXT_TOP_RATIO = 0.46f;
 float Z_OFFSET = 0.0f;  // 运行时整体偏移
 int   SPEED_LEVEL = 3;
 
+// ★Z 层（按 2026-09-16 真机实测校准：-320~-385 可动，-310 以上不动）
+float Z_UP = -325.0f;           // 抬笔（原 -320 恰在边界，留 5mm 裕量）
+float Z_MID = -350.0f;          // 中位
+float Z_PRE_DOWN = -363.0f;     // 预压
+float Z_DOWN_LIGHT = -382.0f;   // 轻触
+float Z_DOWN_NORMAL = -385.0f;  // 常规书写（实测可动）
+float Z_DOWN_HEAVY = -388.0f;   // 重压（比书写深 3mm，真机验证后再用）
+float g_z_top = -320.0f;        // 设备最上可动 Z（实测）
+float g_z_bottom = -410.0f;     // 设备最下可动 Z（下限保护，-385 以下未实测）
+
 std::string HANZI_BASE_DIR = "D:/objects/hanzi-writer-data"; // HanziWriter 数据根
 std::string THEME_NAME = "jiangxue";                          // 主题
 
 bool  g_dryRun = false;        // DRYRUN：不打开串口，不发报文
-volatile bool g_estop = false; // 急停
+std::atomic_bool g_estop = false; // 急停
+std::atomic_bool g_estop_stop = false;
 
 InkStation g_ink;
 
@@ -32,6 +47,49 @@ DrawTheme g_theme;             // 主题与运行时参数
 bool  g_autoDraw = true;
 bool  g_enableDip = false;     // 蘸墨总开关（默认关闭，先排除干扰）
 bool  g_highQuality = true;
+
+float g_center_x = 0.f;        // ★中心点（菜单3复位目标）
+float g_center_y = 0.f;
+float g_center_z = Z_UP;       // ★中心点复位高度（默认抬笔高度）
+std::string g_logPath;         // ★本次运行日志路径
+bool        g_logEnable = true;
+static FILE* g_logFile = nullptr;
+
+// ★设备 Z 行程校验（按实测范围，config 可调）
+bool inZRange(float z) { return z >= g_z_bottom && z <= g_z_top; }
+
+// --------------------------- 日志 ---------------------------
+void log_init() {
+    _mkdir("logs");
+    std::time_t t = std::time(nullptr);
+    std::tm tmv{};
+    localtime_s(&tmv, &t);
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "logs/Robot_%04d%02d%02d_%02d%02d%02d.log",
+        tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    g_logPath = buf;
+    g_logFile = std::fopen(g_logPath.c_str(), "a");
+    if (g_logFile) {
+        std::fprintf(g_logFile, "==== Robot 运行日志 %04d-%02d-%02d %02d:%02d:%02d ====\n",
+            tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+            tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        std::fflush(g_logFile);
+    }
+}
+
+// 每条输出带毫秒时间戳写入日志（g_logEnable 关闭时跳过）
+static void log_write(const std::string& gbk_line) {
+    if (!g_logEnable || !g_logFile) return;
+    auto now = std::chrono::system_clock::now();
+    std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm tmv{};
+    localtime_s(&tmv, &t);
+    int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count() % 1000);
+    std::fprintf(g_logFile, "[%02d:%02d:%02d.%03d] %s\n",
+        tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms, gbk_line.c_str());
+    std::fflush(g_logFile);
+}
 
 // --------------------------- 字符编码工具 ---------------------------
 std::string w2gbk(const std::wstring& ws) {
@@ -48,8 +106,37 @@ std::wstring mb2w(const std::string& s) {
     MultiByteToWideChar(CP_GBK, 0, s.c_str(), (int)s.size(), ws.data(), wlen);
     return ws;
 }
-void wprintln(const std::wstring& ws) { std::cout << w2gbk(ws) << "\n"; }
-void wprint(const std::wstring& ws) { std::cout << w2gbk(ws); }
+// ★输出通道说明（黑窗/吞字问题的最终修复）：
+//   1) 控制台（真窗口）：一律 WriteConsoleW 直写 UTF-16——与代码页/字体无关，
+//      彻底解决"部分控制台主机不渲染 GBK 中文/无换行写入"的问题；
+//   2) 重定向（文件/管道）：输出 GBK 字节（供测试脚本比对），行为与旧版一致；
+//   3) wprint 统一按整行输出（补换行）。
+static bool is_console_handle(HANDLE h) {
+    DWORD mode = 0;
+    return h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode);
+}
+static void console_write_line(const std::wstring& ws) {
+    log_write(w2gbk(ws));   // ★所有输出统一入日志（含 DRYRUN 帧）
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (is_console_handle(h)) {
+        DWORD written = 0;
+        if (!ws.empty()) WriteConsoleW(h, ws.c_str(), (DWORD)ws.size(), &written, nullptr);
+        WriteConsoleW(h, L"\n", 1, &written, nullptr);
+    }
+    else {
+        std::string s = w2gbk(ws);
+        printf("%s\n", s.c_str());
+        fflush(stdout);
+    }
+}
+void wprintln(const std::wstring& ws) { console_write_line(ws); }
+void wprint(const std::wstring& ws) { console_write_line(ws); }
+
+// 仅写日志、不上屏（真机模式 TX 帧记录：避免刷屏，但日志可完整复盘）
+void log_line(const std::wstring& ws) {
+    if (ws.empty()) return;
+    log_write(w2gbk(ws));
+}
 
 std::wstring normalizeComName(const std::wstring& in) {
     if (in.empty()) return L"\\\\.\\COM1";

@@ -1,0 +1,31 @@
+{
+  "auto_draw": true,
+  "center": [
+    0.0,
+    0.0,
+    -320.0
+  ],
+  "char_spacing": 1.0,
+  "enable_dip": false,
+  "high_quality": false,
+  "ink": [
+    0.0,
+    0.0,
+    -350.0,
+    false
+  ],
+  "speed": 3,
+  "z_layers": [
+    -325.0,
+    -350.0,
+    -363.0,
+    -382.0,
+    -385.0,
+    -388.0
+  ],
+  "z_limits": [
+    -320.0,
+    -410.0
+  ],
+  "z_offset": 0.0
+}

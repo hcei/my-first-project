@@ -1,9 +1,13 @@
 // motion.cpp — 运动轨迹处理与发送实现
 // 由 Robot.cpp（单文件版）拆分而来；实现逐行保真
 // （含首落笔加固、冷启动强节流、批量失败回退逐点等关键逻辑）。
+// ★GUI 阶段：transmitTrajectoryWithSplit / do_dip_and_groom / write_text_streamed
+//   增加 task::progress 钩子（阶段、字符、轨迹点计数——内存内更新，不打印）。
+//   计数不改变任何发送逻辑与节拍。
 #include "motion.h"
 #include "serial_port.h"
 #include "hanzi.h"
+#include "gui_service.h"
 
 #include <chrono>
 #include <cmath>
@@ -63,7 +67,7 @@ int get_STROKE_END_DWELL_MS(bool isCalli) { return (g_highQuality && isCalli) ? 
 int get_POINT_RATE_LIMIT_MS(bool isCalli) { return (g_highQuality && isCalli) ? 90 : POINT_RATE_LIMIT_MS_BASE; }
 
 int estimateMoveMs(const Point& prev, const Point& cur, bool isCalli) {
-    float vx = speedLevelToXYmmPerSec(SPEED_LEVEL);
+    float vx = speedLevelToXYmmPerSec(cur.speed);
     float dx = cur.x - prev.x, dy = cur.y - prev.y;
     float dxy = std::sqrt(dx * dx + dy * dy);
     int t_xy = (vx > 1e-3f) ? int(std::ceil(dxy / vx * 1000.f)) : 0;
@@ -94,7 +98,7 @@ float angle_between(const Point& a, const Point& b, const Point& c) {
 // --------------------------- 串口预热（更新位姿） ---------------------------
 void serial_pre_warm(SerialPort& sp) {
     wprintln(L"[预热] 开始...");
-    Point center_up{ 0.f,0.f,Z_UP,false,(uint8_t)SPEED_LEVEL,"UP-WARM" };
+    Point center_up{ g_center_x,g_center_y,Z_UP,false,(uint8_t)SPEED_LEVEL,"UP-WARM" };
     int good = 0, tries = 0;
     while (tries < PREWARM_MAX_PROBES && good < PREWARM_MIN_GOOD_RESP) {
         if (sp.sendPointRetry(center_up)) ++good;
@@ -178,6 +182,7 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
             // 抬笔段：逐点发送（用于定位）
             const Point& p = filtered[i];
             if (!sp.sendPointRetry(p)) return false;
+            gs::task::traj_add_done(1, false);   // ★GUI 钩子：轨迹点进度
             sleep_move(lastSent, p, inCalli);
             lastSent = &filtered[i];
             ++i;
@@ -208,10 +213,12 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
 
                     lastSent = &filtered[k];
                     firstDownDuplicated = true;
+                    gs::task::traj_add_done(1, true);   // ★GUI 钩子（首落笔点）
                     continue;
                 }
 
                 if (!sp.sendPointRetry(p)) return false;
+                gs::task::traj_add_done(1, true);       // ★GUI 钩子：书法逐点进度
 
                 // 角点轻微停顿
                 if (k >= 1 && k + 1 < j) {
@@ -238,12 +245,14 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
                     for (size_t t = 0; t < batch.size(); ++t) {
                         const Point& p_ref = filtered[i + k + t];  // 指向 filtered 中的真实元素
                         if (!sp.sendPointRetry(p_ref)) return false;
+                        gs::task::traj_add_done(1, true);           // ★GUI 钩子：回退逐点进度
                         sleep_move(lastSent, p_ref, false);
                         lastSent = &p_ref;                          // 指向稳定存储
                     }
                 }
                 else {
                     const Point& plast = filtered[i + k + chunk - 1];
+                    gs::task::traj_add_done(chunk, true);           // ★GUI 钩子：批量进度
                     sleep_move(lastSent, plast, false);
                     lastSent = &plast;
                 }
@@ -259,8 +268,8 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
 bool do_dip_and_groom(SerialPort& sp, const InkStation& ink) {
     if (!g_enableDip) return true;          // 总开关：默认关闭
     if (!ink.valid) {
-        wprintln(L"[提示] 未设置蘸墨位（菜单14）。跳过蘸墨。");
-        return true;
+        wprintln(L"[错误] 已开启蘸墨但未设置蘸墨位（菜单14），中止任务。");
+        return false;
     }
     const uint8_t SLOW = 1;
     const uint8_t FAST = (uint8_t)std::min(6, std::max(2, SPEED_LEVEL));
@@ -295,11 +304,16 @@ bool do_dip_and_groom(SerialPort& sp, const InkStation& ink) {
     traj.push_back(Point{ ink.x, ink.y, Z_UP, false, SLOW, "UP-END" });
 
     // 实际发送（作为“描边”逻辑：不需要角点停顿，calli_end=0）
-    return transmitTrajectoryWithSplit(sp, traj, 0);
+    bool ok = transmitTrajectoryWithSplit(sp, traj, 0);
+    if (ok) gs::task::dip_done();   // ★GUI 钩子：一次完整蘸墨流程完成（合规提示用）
+    return ok;
 }
 
 // --------------------------- ★抬笔预定位→等待（首字/每行首字用） ---------------------------
 bool move_up_to_and_wait(SerialPort& sp, const Point& targetUp, bool isCalli) {
+    // 发送会立即更新软件目标位姿，因此必须在发送前保存旧位置用于估算预定位距离。
+    Point prev = g_pose_init ? g_last_pose : Point{ 0.f,0.f,Z_UP,false,(uint8_t)SPEED_LEVEL,"POSE0" };
+
     // 1) 先抬笔到目标XY（保证安全）
     Point up = targetUp;
     up.z = Z_UP;
@@ -308,8 +322,7 @@ bool move_up_to_and_wait(SerialPort& sp, const Point& targetUp, bool isCalli) {
     if (!sp.sendPointRetry(up)) return false;
 
     // 2) 估算到位时间：若没有历史pose，就按 0,0,UP 估
-    Point prev = g_pose_init ? g_last_pose : Point{ 0.f,0.f,Z_UP,false,(uint8_t)SPEED_LEVEL,"POSE0" };
-    float vx = speedLevelToXYmmPerSec(SPEED_LEVEL);
+    float vx = speedLevelToXYmmPerSec(up.speed);
     float dx = up.x - prev.x, dy = up.y - prev.y;
     float dxy = std::sqrt(dx * dx + dy * dy);
     int t_xy = (vx > 1e-3f) ? int(std::ceil(dxy / vx * 1000.f)) : 0;
@@ -334,7 +347,10 @@ bool write_text_streamed(SerialPort& sp, const std::wstring& chars, const TextPl
 
     // 开写前可选蘸墨（默认关闭，用菜单15开启）
     if (g_enableDip) {
-        do_dip_and_groom(sp, g_ink);
+        if (!do_dip_and_groom(sp, g_ink)) {
+            wprintln(L"[错误] 蘸墨流程失败，禁止开始书写。");
+            return false;
+        }
     }
 
     for (size_t i = 0; i < chars.size(); ++i) {
@@ -376,10 +392,14 @@ bool write_text_streamed(SerialPort& sp, const std::wstring& chars, const TextPl
 
         // 发送（书法全部算 calli 段）
         if (!transmitTrajectoryWithSplit(sp, one, one.size())) return false;
+        gs::task::char_done((int)i);          // ★GUI 钩子：第 i 个字符书写完成
 
         // 每写5个字再蘸一次（开启时）
         if (g_enableDip && (((int)(i + 1)) % 5 == 0)) {
-            do_dip_and_groom(sp, g_ink);
+            if (!do_dip_and_groom(sp, g_ink)) {
+                wprintln(L"[错误] 中途蘸墨失败，书写任务终止。");
+                return false;
+            }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(per_char_pause_ms));
@@ -387,7 +407,10 @@ bool write_text_streamed(SerialPort& sp, const std::wstring& chars, const TextPl
 
     // 收尾：若总字数不是5的倍数且开启蘸墨，再补一次
     if (g_enableDip && (((int)chars.size() % 5) != 0)) {
-        do_dip_and_groom(sp, g_ink);
+        if (!do_dip_and_groom(sp, g_ink)) {
+            wprintln(L"[错误] 收尾蘸墨失败，任务未完成。");
+            return false;
+        }
     }
     return true;
 }

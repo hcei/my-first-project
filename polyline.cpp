@@ -81,7 +81,7 @@ bool drawPolylinesFromFile(const std::string& path, std::vector<Point>& traj) {
     if (!loadPolylinesFromJson(path, polys, mm_per_unit, user_scale)) return false;
 
     // 放到底部区域
-    WorkArea area = { SAFE_INIT_XMIN, SAFE_INIT_XMAX, SAFE_INIT_YMIN, SAFE_INIT_YMAX };
+    WorkArea area = g_safeArea;
     float totalH = area.ymax - area.ymin;
     float bottom_ymin = area.ymin + SAFE_MARGIN;
     float bottom_ymax = area.ymin + totalH * (1.0f - TEXT_TOP_RATIO) - V_GAP_BETWEEN * 0.5f - SAFE_MARGIN;

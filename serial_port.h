@@ -11,6 +11,7 @@ public:
 
     bool open(const std::wstring& portName, DWORD baud = BAUDRATE, BYTE parity = EVENPARITY, BYTE bytesize = 8, BYTE stopbits = ONESTOPBIT);
     void close();
+    bool is_open() const { return h_ != INVALID_HANDLE_VALUE; }   // GUI 服务层状态查询
 
     bool write(const uint8_t* buf, size_t len);
     bool read_exact(uint8_t* buf, size_t need, DWORD timeout_ms);

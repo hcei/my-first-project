@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=1494, initial-scale=1">
+  <title>书画机械臂调试助手 - GUI 静态设计原型</title>
+  <style>
+    :root {
+      --purple: #b56bd7;
+      --purple-dark: #7b4bb3;
+      --purple-soft: #f5e9fb;
+      --blue: #79c8f2;
+      --teal: #63c4be;
+      --ink: #27303d;
+      --muted: #697386;
+      --line: #dce5ef;
+      --bg: #f7f9fc;
+      --danger: #e65068;
+      --ok: #29aa55;
+      --warn: #f0a33b;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-width: 1494px; background: #e9edf3; color: var(--ink); font-family: "Microsoft YaHei", "Segoe UI", sans-serif; }
+    body { padding: 10px; }
+    .window { width: 1494px; height: 1184px; margin: 0 auto; background: white; border: 1px solid #c8d0dc; border-radius: 26px 26px 0 0; overflow: hidden; box-shadow: 0 8px 24px #66708522; }
+    .titlebar { height: 45px; padding: 0 18px; display: flex; align-items: center; justify-content: space-between; background: var(--purple); color: white; font-size: 26px; font-weight: 700; }
+    .window-actions { display: flex; gap: 18px; font-size: 27px; line-height: 1; }
+    .shell { height: calc(100% - 77px); display: grid; grid-template-columns: 212px 1fr; }
+    .sidebar { border-right: 1px solid var(--line); background: #fff; padding: 14px 0; }
+    .nav-item, .nav-group { min-height: 58px; padding: 0 30px; display: flex; align-items: center; gap: 18px; font-size: 18px; }
+    .nav-item { border-left: 6px solid transparent; }
+    .nav-item.active { border-left-color: var(--purple); background: #faf8fc; font-weight: 700; }
+    .nav-group { justify-content: space-between; padding-right: 38px; color: #343a46; }
+    .nav-sub { padding: 2px 0 10px; }
+    .nav-sub .nav-item { padding-left: 61px; min-height: 46px; font-size: 16px; }
+    .icon { width: 25px; text-align: center; font-size: 22px; color: #343434; }
+    .content { background: var(--bg); padding: 16px 9px 0; overflow: hidden; }
+    .page { display: none; height: 100%; }
+    .page.default { display: block; }
+    .page:target { display: block; }
+    .page:target ~ .page.default { display: none; }
+    .page-title { margin: 8px 24px 14px; font-size: 26px; }
+    .grid-home { display: grid; grid-template-columns: 1.55fr .8fr; gap: 18px; }
+    .panel { background: #fff; border: 2px solid var(--line); border-radius: 20px; padding: 25px; }
+    .panel h2 { margin: 0 0 20px; font-size: 25px; }
+    .device-info { min-height: 310px; }
+    .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px 40px; font-size: 18px; }
+    .info-row { display: grid; grid-template-columns: 106px 1fr; }
+    .label { font-weight: 700; color: #151515; }
+    .value { color: var(--purple-dark); }
+    .value.ok { color: var(--ok); } .value.warn { color: var(--warn); } .value.danger { color: var(--danger); } .value.blue { color: #258ce5; }
+    .side-stack { display: grid; gap: 18px; }
+    .battery-box { height: 140px; border: 5px solid var(--purple); border-radius: 18px; display: flex; align-items: center; justify-content: center; box-shadow: 0 4px 12px #b56bd755 inset; font-size: 20px; font-weight: 700; }
+    .ring-row { display: flex; justify-content: space-around; text-align: center; }
+    .ring-wrap { font-size: 16px; font-weight: 700; }
+    .ring { width: 118px; height: 118px; border: 13px solid #e3eaf3; border-top-color: #70bdf2; border-radius: 50%; display: grid; place-items: center; margin-bottom: 11px; }
+    .ring span { color: #258ce5; font-size: 24px; }
+    .control-panel { margin-top: 18px; display: grid; grid-template-columns: 1.1fr .95fr; gap: 20px; }
+    .button-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px 24px; }
+    button, .button { border: 0; border-radius: 12px; padding: 15px 12px; color: white; background: var(--blue); font-size: 18px; font-weight: 700; }
+    .button.teal { background: var(--teal); } .button.danger { background: var(--danger); }
+    .select, input, textarea { width: 100%; border: 2px solid #cfdae8; border-radius: 8px; background: #fff; padding: 12px; font-size: 16px; color: var(--ink); }
+    .select { margin-top: 15px; color: var(--purple-dark); }
+    .toggle-list { border: 2px solid var(--line); border-radius: 16px; padding: 18px; background: #f8fbff; }
+    .toggle-row { min-height: 43px; display: flex; align-items: center; justify-content: space-between; font-size: 18px; font-weight: 700; }
+    .toggle { width: 63px; height: 32px; border-radius: 20px; background: #b9c4d1; padding: 4px; }
+    .toggle.on { background: var(--ok); } .toggle i { display: block; width: 24px; height: 24px; background: white; border-radius: 50%; margin-left: 0; } .toggle.on i { margin-left: 31px; }
+    .footer { height: 32px; display: flex; justify-content: space-between; align-items: center; padding: 0 18px; background: #f7e9fc; color: #687080; font-size: 16px; }
+    .footer strong { color: var(--purple); }
+    .sub-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .wide { grid-column: 1 / -1; }
+    .status-strip { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 18px; }
+    .status-chip { padding: 14px; border: 2px solid var(--line); background: #fff; border-radius: 12px; }
+    .status-chip b { display: block; font-size: 21px; margin-bottom: 5px; } .status-chip span { color: var(--muted); }
+    .mode-tabs { display: flex; gap: 10px; margin-bottom: 18px; } .mode-tabs .button { flex: 1; text-align: center; }
+    .log-table { width: 100%; border-collapse: collapse; font-size: 14px; } .log-table th, .log-table td { border-bottom: 1px solid var(--line); padding: 11px 9px; text-align: left; vertical-align: top; } .log-table th { color: var(--muted); background: #f7f9fc; }
+    .badge { display: inline-block; padding: 3px 8px; border-radius: 10px; background: var(--purple-soft); color: var(--purple-dark); font-weight: 700; } .badge.cli { background: #e7f5ff; color: #1677b6; } .badge.ok { background: #e8f7ed; color: #15843c; } .badge.err { background: #ffebee; color: #c4364b; }
+    .command-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; } .command { border: 1px solid var(--line); border-radius: 10px; padding: 14px; background: #fff; } .command b { display: block; margin-bottom: 8px; }
+    .preview { height: 355px; border: 2px dashed #b9c9db; border-radius: 15px; background: linear-gradient(#fff, #f9fbfe); position: relative; overflow: hidden; }
+    .axis-x, .axis-y { position: absolute; background: #cad6e4; } .axis-x { left: 6%; right: 6%; top: 50%; height: 1px; } .axis-y { top: 8%; bottom: 8%; left: 50%; width: 1px; }
+    .path { position: absolute; left: 22%; top: 20%; width: 58%; height: 58%; border: 4px solid var(--purple); border-radius: 50% 45% 48% 40%; transform: rotate(-18deg); opacity: .8; }
+    .cursor { position: absolute; left: 54%; top: 45%; width: 15px; height: 15px; background: var(--danger); border-radius: 50%; box-shadow: 0 0 0 8px #e6506833; }
+    .kv { display: grid; grid-template-columns: 140px 1fr; gap: 13px; font-size: 17px; } .kv b { color: #151515; }
+    .source-note { padding: 10px 14px; border-left: 4px solid var(--warn); background: #fff7e9; color: #81571c; margin-bottom: 18px; }
+  </style>
+</head>
+<body>
+  <div class="window">
+    <header class="titlebar"><span>书画机械臂调试助手</span><span class="window-actions">−　×</span></header>
+    <div class="shell">
+      <aside class="sidebar">
+        <a class="nav-item active" href="#home"><span class="icon">⌂</span>主页</a>
+        <a class="nav-item" href="#connect"><span class="icon">▣</span>设备连接</a>
+        <div class="nav-group"><span>写字与绘画</span><span>⌄</span></div>
+        <div class="nav-sub">
+          <a class="nav-item" href="#write"><span class="icon">✎</span>书写任务</a>
+        </div>
+      </aside>
+      <main class="content">
+        <section id="home" class="page default">
+          <h1 class="page-title">设备总览</h1>
+          <div class="grid-home">
+            <section class="panel device-info"><h2>设备信息</h2><div class="info-grid">
+              <div class="info-row"><span class="label">设备状态</span><span class="value ok">已连接</span></div><div class="info-row"><span class="label">连接类型</span><span class="value blue">RS485 / Modbus RTU</span></div>
+              <div class="info-row"><span class="label">串口</span><span class="value">COM3</span></div><div class="info-row"><span class="label">通信参数</span><span class="value">9600 / 8E1</span></div>
+              <div class="info-row"><span class="label">当前坐标</span><span class="value blue">X 0.0　Y 0.0　Z -325.0 mm</span></div><div class="info-row"><span class="label">坐标依据</span><span class="value warn">最后有效 ACK 后的软件位姿</span></div>
+              <div class="info-row"><span class="label">当前模式</span><span class="value">空闲 / 抬笔</span></div><div class="info-row"><span class="label">急停状态</span><span class="value ok">未触发</span></div>
+              <div class="info-row"><span class="label">当前任务</span><span class="value">无任务</span></div><div class="info-row"><span class="label">最近响应</span><span class="value ok">ACK 有效</span></div>
+            </div></section>
+            <div class="side-stack"><section class="panel"><h2>设备连接</h2><div class="kv"><b>端口</b><span>COM3</span><b>状态</b><span class="value ok">在线</span><b>最近心跳</b><span>12:16:50.948</span></div></section>
+              <section class="panel"><h2>设备资源</h2><div class="ring-row"><div class="ring-wrap"><div class="ring"><span>0.0%</span></div>内部存储</div><div class="ring-wrap"><div class="ring"><span>0.0%</span></div>运行内存</div></div></section></div>
+          </div>
+          <div class="control-panel"><section class="panel"><h2>快捷操作</h2><div class="button-grid"><div class="button">⏻ 系统复位</div><div class="button">↕ 回中心点</div><div class="button teal">↯ 发送测试点</div><div class="button teal">▱ 查询位姿</div><div class="button">↻ 刷新设备</div><div class="button danger">■ 急停</div></div></section>
+            <section class="panel"><h2>运行开关</h2><div class="toggle-list"><div class="toggle-row">Dry Run <span class="toggle"><i></i></span></div><div class="toggle-row">自动描边 <span class="toggle on"><i></i></span></div><div class="toggle-row">高质模式 <span class="toggle on"><i></i></span></div><div class="toggle-row">蘸墨功能 <span class="toggle"><i></i></span></div><div class="select">当前速度：3 档　　字间距：1.0 mm</div></div></section></div>
+        </section>
+        <section id="connect" class="page"><h1 class="page-title">设备连接</h1><div class="sub-grid"><section class="panel"><h2>串口连接</h2><div class="kv"><b>串口</b><select class="select"><option>COM3</option><option>COM4</option></select><b>波特率</b><select class="select"><option>9600</option></select><b>校验</b><select class="select"><option>Even / 8 / 1</option></select></div><div class="button-grid" style="margin-top:22px"><div class="button teal">连接设备</div><div class="button">断开连接</div><div class="button">刷新串口</div><div class="button">发送心跳</div></div></section><section class="panel"><h2>连接诊断</h2><div class="status-strip"><div class="status-chip"><b class="value ok">在线</b><span>串口句柄</span></div><div class="status-chip"><b class="value ok">有效</b><span>最近 ACK</span></div><div class="status-chip"><b>0</b><span>连续失败</span></div><div class="status-chip"><b>800 ms</b><span>读取超时</span></div><div class="status-chip"><b>12:16:50</b><span>最近通信</span></div></div><div class="source-note">当前协议实现可记录 TX/RX 帧和 ACK 校验结果；尚未确认控制器是否提供独立状态、报警和真实坐标寄存器。</div></section></div></section>
+        <section id="write" class="page"><h1 class="page-title">书写任务</h1><div class="sub-grid"><section class="panel"><h2>输入与任务预检</h2><textarea rows="4" placeholder="输入要书写的汉字或诗句"></textarea><div class="kv" style="margin-top:18px"><b>字号</b><span>60 mm</span><b>布局</b><span>上区书写 / 下区绘画</span><b>速度</b><span>3 档，预计 48 秒</span><b>字形数据</b><span class="value ok">可用</span></div><div class="button-grid" style="margin-top:20px"><div class="button teal">预检任务</div><div class="button">开始书写</div><div class="button danger">停止任务</div><div class="button">保存任务配置</div></div></section><section class="panel"><h2>任务进度</h2><div class="status-strip"><div class="status-chip"><b>空闲</b><span>当前阶段</span></div><div class="status-chip"><b>0 / 4</b><span>字符</span></div><div class="status-chip"><b>0 / 128</b><span>轨迹点</span></div><div class="status-chip"><b>抬笔</b><span>笔状态</span></div><div class="status-chip"><b>未启用</b><span>蘸墨</span></div></div><div class="preview"><div class="axis-x"></div><div class="axis-y"></div><div class="path"></div><div class="cursor"></div></div></section></div></section>
+      </main>
+    </div>
+    <footer class="footer"><strong>GUI 设计原型 v0.1</strong><span>状态：模拟数据　|　日志：结构化字段示例　|　底层：Modbus RTU</span><span>设备调试助手</span></footer>
+  </div>
+</body>
+</html>

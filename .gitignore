@@ -11,3 +11,8 @@ x64/
 
 # 测试临时文件
 _test_*
+
+# GUI 运行时状态（窗口尺寸记忆、上次任务文本）与审计日志
+gui_window.txt
+last_task.txt
+logs/

@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -46,14 +47,17 @@ static const float CHAR_SPACING_MIN = 0.5f;
 extern float TEXT_TOP_RATIO;
 static const float V_GAP_BETWEEN = 1.0f; // 上下区域间隙
 
-// Z 层（mm，负值向下）
-static const float Z_UP = -320.0f;
-static const float Z_MID = -350.0f;
-static const float Z_PRE_DOWN = -363.0f;
-static const float Z_DOWN_LIGHT = -382.0f;
-static const float Z_DOWN_NORMAL = -385.0f;
-static const float Z_DOWN_HEAVY = -388.0f;
-extern float      Z_OFFSET;  // 运行时整体偏移
+// Z 层（mm，负值向下）——★2026-09-16 真机实测校准：设备可动范围约 -320~-385，
+// -310 及以上不动（ACK 但不执行）。全部改为可配置全局，随 robot_config.json 持久化。
+extern float Z_UP;          // 抬笔（原 -320 恰在可动边界，调至 -325 留裕量）
+extern float Z_MID;         // 中位
+extern float Z_PRE_DOWN;    // 预压
+extern float Z_DOWN_LIGHT;  // 轻触
+extern float Z_DOWN_NORMAL; // 常规书写
+extern float Z_DOWN_HEAVY;  // 重压（点）
+extern float      Z_OFFSET; // 运行时整体偏移
+extern float g_z_top;       // ★设备最上可动 Z（实测 -320 可动、-310 不动）
+extern float g_z_bottom;    // ★设备最下可动 Z（下限保护，-385 已实测可动）
 
 // 速度档（1~6）
 extern int SPEED_LEVEL;
@@ -158,7 +162,8 @@ struct InkStation {
 extern std::string HANZI_BASE_DIR;   // HanziWriter 数据根
 extern std::string THEME_NAME;       // 主题
 extern bool  g_dryRun;               // DRYRUN：不打开串口，不发报文
-extern volatile bool g_estop;        // 急停
+extern std::atomic_bool g_estop;     // 急停
+extern std::atomic_bool g_estop_stop;// 急停轮询线程停止标志
 extern InkStation g_ink;
 extern bool  g_pose_init;            // ★全局位姿跟踪
 extern Point g_last_pose;
@@ -168,6 +173,11 @@ extern DrawTheme g_theme;
 extern bool  g_autoDraw;
 extern bool  g_enableDip;            // 蘸墨总开关（默认关闭，先排除干扰）
 extern bool  g_highQuality;          // 高质模式
+extern float g_center_x;             // ★中心点（菜单3复位目标；默认 0,0，菜单17可设）
+extern float g_center_y;
+extern float g_center_z;             // ★中心点复位高度（默认 Z_UP，菜单17可设）
+extern std::string g_logPath;        // ★本次运行日志路径（log_init 生成）
+extern bool        g_logEnable;      // ★日志记录开关（默认开，菜单18切换）
 
 // --------------------------- 内联小工具 ---------------------------
 static inline void update_pose_from(const Point& p) {
@@ -184,7 +194,7 @@ static inline int16_t mm_to_dev10(float v) {
 static inline bool inXYRange(float x, float y, const WorkArea& w) {
     return (x >= w.xmin && x <= w.xmax && y >= w.ymin && y <= w.ymax);
 }
-static inline bool inZRange(float z) { return (z >= -410.0f && z <= -250.0f); }
+bool inZRange(float z);   // ★改为函数：按设备实测行程 g_z_bottom~g_z_top 校验
 static inline bool isCJKOrPunct(wchar_t c) {
     if (c == L' ' || c == L'\t' || c == L'\r' || c == L'\n') return false;
     if ((c >= 0x4E00 && c <= 0x9FFF) || (c >= 0x3000 && c <= 0x303F) || (c >= 0xFF00 && c <= 0xFFEF)) return true;
@@ -197,6 +207,11 @@ std::wstring mb2w(const std::string& s);
 void wprintln(const std::wstring& ws);
 void wprint(const std::wstring& ws);
 std::wstring normalizeComName(const std::wstring& in);
+
+// 日志：main 启动时调用一次，生成 logs/Robot_时间.log；
+// 之后所有 wprintln/wprint 输出（含 DRYRUN 帧）自动带毫秒时间戳写入
+void log_init();
+void log_line(const std::wstring& ws);   // ★仅写日志不上屏（真机模式 TX 帧记录用）
 
 // CRC16(Modbus)
 uint16_t crc16_modbus(const uint8_t* data, size_t len);
