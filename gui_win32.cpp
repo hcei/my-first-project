@@ -46,6 +46,132 @@ static const int WIN_W = 1494, WIN_H = 1204;
 static const int TITLE_H = 45, FOOTER_H = 32, NAV_W = 212;
 static const int MARGIN = 24, PANEL_PAD = 25;
 
+// ★页面几何：绘制与子控件必须共用同一基准。
+// OnPaint 传入的 pageRc 即页面内容区矩形；Draw* 与 Create*Controls 都由
+// PageMetrics() 取得原点与可用尺寸，避免"绘制按客户区绝对坐标、控件按页面坐标"的错位。
+static const int PAGE_X = NAV_W + 8;   // 页面内容区左边界（客户区坐标）
+static const int PAGE_Y = TITLE_H + 4; // 页面内容区上边界
+static const int PAGE_R = 6;           // 右侧留白
+static const int HINT_H = 46;          // 顶部提示条高度
+static const int PANEL_TOP = 66;       // 页面内第一排面板的 y（页面局部坐标）
+static const int PANEL_GAP = 18;       // 面板行间距
+static const int INFO_ROW_H = 28;      // 设备信息行高
+static const int CTRL_PANEL_H = 280;   // 主页"快捷操作/运行开关"面板高度（内容高度，不拉伸）
+static const int INFO_ROW_MAX = 44;    // 设备信息行距上限（多余高度均匀铺开，不留大片空白）
+static const int INFO_LABEL_W = 88;    // 设备信息标签列宽（容纳 4 字标签）
+static const int INFO_VALUE_DX = 94;   // 设备信息值列相对标签起点的偏移
+static const int CONNECT_PANEL_H = 246;// 连接页面板高度
+static const int WRITE_PANEL_H = 262;  // 书写页面板高度
+static const int BTN_H = 40, BTN_PITCH = 52;
+static const int CHK_H = 24, CHK_PITCH = 30;
+
+// 由客户区尺寸构造页面矩形（供 Create*Controls 使用，与 OnPaint 的 pageRc 一致）
+static RECT PageRectFromClient(int cw, int ch) {
+    return RECT{ PAGE_X, PAGE_Y, cw - PAGE_R, ch - FOOTER_H };
+}
+// 主页"设备信息"面板高度：按可用高度自适应，保证下方控制面板完整可见
+static int HomeInfoH(int H) {
+    return H - PANEL_TOP - PANEL_GAP - CTRL_PANEL_H - 10;
+}
+// 设备信息行距：高度富余时均匀铺开（上限 INFO_ROW_MAX），避免面板下半大片空白
+static int HomeRowH(int infoH, int lines) {
+    int rows = (lines + 1) / 2;                        // 两列排布 → 行数
+    if (rows < 1) rows = 1;
+    int avail = infoH - 50 - 6;                        // 减去标题区与底部留白
+    int h = avail / rows;
+    if (h < INFO_ROW_H) h = INFO_ROW_H;
+    if (h > INFO_ROW_MAX) h = INFO_ROW_MAX;
+    return h;
+}
+
+// ---- 三页统一几何：绘制与子控件共用同一套计算结果 ----
+// 单面板页（连接 / 书写）：左右两栏等宽
+struct TwoColGeo {
+    int x0, y0, W, H;        // 页面内容区
+    int top;                 // 首排面板 y
+    int leftX, rightX;       // 两栏面板左边界
+    int colW;                // 每栏宽度
+    int innerX;              // 左栏内容起点（面板 + 内边距）
+    int innerW;              // 左栏内容宽度
+    int panelH;
+};
+static TwoColGeo TwoColLayout(const RECT& rc, int panelH) {
+    TwoColGeo g{};
+    g.x0 = rc.left; g.y0 = rc.top;
+    g.W = rc.right - rc.left; g.H = rc.bottom - rc.top;
+    g.panelH = panelH;
+    g.top = g.y0 + PANEL_TOP;
+    g.colW = (g.W - MARGIN * 2 - PANEL_GAP) / 2;
+    g.leftX = g.x0 + MARGIN;
+    g.rightX = g.leftX + g.colW + PANEL_GAP;
+    g.innerX = g.leftX + PANEL_PAD;
+    g.innerW = g.colW - PANEL_PAD * 2;
+    return g;
+}
+
+// 主页几何：信息面板 + 右列 + 底部"快捷操作 / 运行开关"
+struct HomeGeo {
+    int x0, y0, W, H;
+    int top;
+    int leftW, rightW, infoH;
+    int rx;                  // 右列左边界
+    int connH;               // 右列"设备连接"面板高度
+    int cTop, cH;            // 底部控制面板
+    int blW;                 // 快捷操作面板宽度
+    int ctlX, ctlW;          // 运行开关面板
+    int btnX, btnY, btnW;    // 快捷操作按钮起点与单列宽
+    int chkX, chkW;          // 复选框列
+    int spdX, spdW;          // 参数列（速度 / 字间距 / Z 偏移）
+    // 参数列内部布局（相对 spdX；绘制与控件共用）
+    int lblW, pbtnW, valW, editW, applyW;
+    int rowY[3];             // 速度 / 字间距 / Z 偏移 三行的 y
+};
+static HomeGeo HomeLayout(const RECT& rc) {
+    HomeGeo g{};
+    g.x0 = rc.left; g.y0 = rc.top;
+    g.W = rc.right - rc.left; g.H = rc.bottom - rc.top;
+    g.top = g.y0 + PANEL_TOP;
+    g.leftW = (int)((g.W - MARGIN * 2 - PANEL_GAP) * 1.55 / 2.35);
+    g.rightW = g.W - MARGIN * 2 - PANEL_GAP - g.leftW;
+    g.rx = g.x0 + MARGIN + g.leftW + PANEL_GAP;
+    g.infoH = HomeInfoH(g.H);
+    g.connH = 128;
+    g.cTop = g.top + g.infoH + PANEL_GAP;
+    g.cH = CTRL_PANEL_H;                       // 固定内容高度：控件排不满时留白在面板下方，避免面板内大面积空白
+    if (g.cTop + g.cH > g.y0 + g.H - 10)       // 窗口过矮时允许内容向下延伸（顶部对齐），不压缩面板
+        g.H = g.cTop + g.cH + 10 - g.y0;
+    g.blW = (g.W - MARGIN * 2 - PANEL_GAP - 2) / 2;
+    g.ctlX = g.x0 + MARGIN + g.blW + PANEL_GAP;
+    g.ctlW = g.x0 + g.W - MARGIN - g.ctlX;
+    // 快捷操作按钮：两列，面板内边距对齐
+    g.btnX = g.x0 + MARGIN + PANEL_PAD;
+    g.btnW = (g.blW - PANEL_PAD * 2 - 24) / 2;
+    g.btnY = g.cTop + 52;
+    // 运行开关：左列复选框，右列参数（标签在左、控件在右，同一行内依次排列）
+    g.chkX = g.ctlX + PANEL_PAD;
+    g.chkW = 296;
+    g.spdX = g.chkX + g.chkW + 16;
+    g.spdW = g.ctlX + g.ctlW - PANEL_PAD - g.spdX;
+    // 参数列内部宽度：先给足，再按可用宽度收窄（窗口很窄时不溢出）
+    g.lblW = 76; g.pbtnW = 32; g.valW = 72; g.editW = 72; g.applyW = 64;
+    int need = g.lblW + 4 + g.editW + 6 + g.applyW;
+    if (need > g.spdW) {
+        int over = need - g.spdW;
+        g.editW -= over / 2; g.applyW -= over - over / 2;
+        if (g.editW < 44) g.editW = 44;
+        if (g.applyW < 44) g.applyW = 44;
+    }
+    int need2 = g.lblW + g.pbtnW * 2 + g.valW;
+    if (need2 > g.spdW) {
+        g.valW -= need2 - g.spdW;
+        if (g.valW < 40) g.valW = 40;
+    }
+    g.rowY[0] = g.cTop + 52;   // 速度
+    g.rowY[1] = g.cTop + 92;   // 字间距
+    g.rowY[2] = g.cTop + 130;  // Z 偏移
+    return g;
+}
+
 // 控件 ID（1000+ 避免与 IDC_STATIC 冲突）
 enum {
     IDC_BTN_CONNECT = 1001, IDC_BTN_DISCONNECT, IDC_BTN_REFRESH, IDC_COMBO_PORT,
@@ -190,10 +316,7 @@ static void BuildInfoLines() {
         std::wstring pose = fmt(L"X %s　Y %s　Z %s mm", FloatStr((float)snapD("pose", "x")).c_str(),
                                 FloatStr((float)snapD("pose", "y")).c_str(), FloatStr((float)snapD("pose", "z")).c_str());
         g_infoLines.push_back({ L"当前坐标", pose, BLUE });
-        std::wstring ts = to_ws(snapS("pose", "ts"));
-        std::wstring basis = ts.empty() ? std::wstring(L"最后有效 ACK 后的软件位姿")
-                                        : std::wstring(L"最后有效 ACK（") + ts + L"）软件位姿";
-        g_infoLines.push_back({ L"坐标依据", basis, WARN });
+        g_infoLines.push_back({ L"坐标依据", L"软件位姿（最后有效 ACK）", WARN });
         g_infoLines.push_back({ L"笔状态", snapB("pose", "pen_down") ? L"落笔" : L"抬笔", snapB("pose", "pen_down") ? DANGER : OK });
     }
     else {
@@ -211,96 +334,92 @@ static void BuildInfoLines() {
                             ackw == L"valid" ? OK : WARN });
     g_infoLines.push_back({ L"最近 TX", to_ws(snapS("comm", "tx")).empty() ? L"—" : to_ws(snapS("comm", "tx")), MUTED });
     g_infoLines.push_back({ L"连续失败", fmt(L"%d 次", snapI("comm", "fail")), snapI("comm", "fail") > 0 ? DANGER : OK });
-    g_infoLines.push_back({ L"控制器真实位置", L"未接入 / 协议待确认", MUTED });
-    g_infoLines.push_back({ L"存储 / 内存 / 电池", L"未接入 / 协议待确认", MUTED });
+    g_infoLines.push_back({ L"实际位置", L"未接入 / 协议待确认", MUTED });
+    g_infoLines.push_back({ L"资源占用", L"未接入 / 协议待确认", MUTED });
 }
 
 // ---------------- 三个页面绘制 ----------------
 static void DrawHome(HDC dc, RECT& rc) {
-    int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    Panel(dc, MARGIN, 10, w - MARGIN * 2, 54);           // 提示条
+    HomeGeo g = HomeLayout(rc);
+
+    // 顶部提示条（页面内容区整宽）
+    Panel(dc, g.x0 + MARGIN, g.y0 + 10, g.W - MARGIN * 2, HINT_H);
     Text(dc, g_st.lastResult.empty() ? L"就绪。所有操作将记录审计日志（source=GUI, actor=HUMAN）。"
-                                      : g_st.lastResult,
-         MARGIN + PANEL_PAD - 5, 10, w - MARGIN * 2 - PANEL_PAD * 2, 54,
+                                     : g_st.lastResult,
+         g.x0 + MARGIN + PANEL_PAD - 5, g.y0 + 10, g.W - MARGIN * 2 - PANEL_PAD * 2, HINT_H,
          g_st.resultIsErr ? DANGER : PURPLE_DARK, 18, true);
 
-    int top = 78;
-    int leftW = (int)((w - MARGIN * 2 - 18) * 1.55 / 2.35);
-    int rightW = w - MARGIN * 2 - 18 - leftW;
-    int infoH = 318;
-    Panel(dc, MARGIN, top, leftW, infoH);
-    Text(dc, L"设备信息", MARGIN + PANEL_PAD, top + 8, 200, 40, INK, 24, true);
-    int rowH = 33, colW = (leftW - PANEL_PAD * 2) / 2;
-    int y0 = top + 56;
+    // 左栏：设备信息（两列排布）
+    int infoX = g.x0 + MARGIN;
+    Panel(dc, infoX, g.top, g.leftW, g.infoH);
+    Text(dc, L"设备信息", infoX + PANEL_PAD, g.top + 6, 300, 34, INK, 24, true);
+    int colW = (g.leftW - PANEL_PAD * 2) / 2;
+    int y0 = g.top + 50;
+    int rowH = HomeRowH(g.infoH, (int)g_infoLines.size());
     for (size_t i = 0; i < g_infoLines.size(); ++i) {
-        int col = (int)(i / 2), row = (int)(i % 2);
-        int x = MARGIN + PANEL_PAD + col * colW;
+        int col = (int)(i % 2), row = (int)(i / 2);
+        int x = infoX + PANEL_PAD + col * colW;
         int y = y0 + row * rowH;
-        if (y + rowH > top + infoH - 8) break;
-        Text(dc, g_infoLines[i].label, x, y, 100, rowH, INK, 17, true);
-        Text(dc, g_infoLines[i].value, x + 106, y, colW - 116, rowH, g_infoLines[i].color, 17);
+        if (y + rowH > g.top + g.infoH - 6) break;
+        Text(dc, g_infoLines[i].label, x, y, INFO_LABEL_W, rowH, INK, 16, true);
+        Text(dc, g_infoLines[i].value, x + INFO_VALUE_DX, y, colW - INFO_VALUE_DX - 6, rowH,
+             g_infoLines[i].color, 16);
     }
 
     // 右列：设备连接 + 设备资源
-    int rx = MARGIN + leftW + 18;
-    int connH = 128;
-    Panel(dc, rx, top, rightW, connH);
-    Text(dc, L"设备连接", rx + PANEL_PAD, top + 8, 200, 36, INK, 24, true);
+    Panel(dc, g.rx, g.top, g.rightW, g.connH);
+    Text(dc, L"设备连接", g.rx + PANEL_PAD, g.top + 6, 300, 34, INK, 24, true);
     bool conn = snapTop("connected"); bool dry = snapTop("dry_run");
-    Text(dc, L"端口", rx + PANEL_PAD, top + 52, 70, 28, INK, 17, true);
-    Text(dc, to_ws(snapTopS("port")).empty() ? L"—" : to_ws(snapTopS("port")), rx + PANEL_PAD + 76, top + 52, rightW - PANEL_PAD * 2 - 76, 28, INK, 17);
-    Text(dc, L"状态", rx + PANEL_PAD, top + 82, 70, 28, INK, 17, true);
-    Text(dc, dry ? L"DRYRUN" : (conn ? L"在线" : L"离线"), rx + PANEL_PAD + 76, top + 82,
-         rightW - PANEL_PAD * 2 - 76, 28, dry ? WARN : (conn ? OK : DANGER), 17, true);
-    Text(dc, L"最近通信", rx + PANEL_PAD, top + 112, 70, 26, INK, 17, true);
+    int kvW = g.rightW - PANEL_PAD * 2 - 94;
+    Text(dc, L"端口", g.rx + PANEL_PAD, g.top + 46, 88, 26, INK, 16, true);
+    Text(dc, to_ws(snapTopS("port")).empty() ? L"—" : to_ws(snapTopS("port")),
+         g.rx + PANEL_PAD + 94, g.top + 46, kvW, 26, INK, 16);
+    Text(dc, L"状态", g.rx + PANEL_PAD, g.top + 74, 88, 26, INK, 16, true);
+    Text(dc, dry ? L"DRYRUN" : (conn ? L"在线" : L"离线"), g.rx + PANEL_PAD + 94, g.top + 74,
+         kvW, 26, dry ? WARN : (conn ? OK : DANGER), 16, true);
+    Text(dc, L"最近通信", g.rx + PANEL_PAD, g.top + 102, 88, 24, INK, 16, true);
     std::wstring lc = to_ws(snapS("comm", "at"));
-    Text(dc, lc.empty() ? L"—" : lc, rx + PANEL_PAD + 76, top + 112, rightW - PANEL_PAD * 2 - 76, 26, MUTED, 16);
+    Text(dc, lc.empty() ? L"—" : lc, g.rx + PANEL_PAD + 94, g.top + 102, kvW, 24, MUTED, 15);
 
-    int resTop = top + connH + 18, resH = infoH - connH - 18;
-    Panel(dc, rx, resTop, rightW, resH);
-    Text(dc, L"设备资源", rx + PANEL_PAD, resTop + 8, 200, 36, INK, 24, true);
-    Text(dc, L"内部存储 / 运行内存 / 电池：未接入（协议未确认）",
-         rx + PANEL_PAD, resTop + 52, rightW - PANEL_PAD * 2, 30, MUTED, 16);
-    Text(dc, L"审计日志：" + to_ws(snapTopS("jsonl")), rx + PANEL_PAD, resTop + 84,
-         rightW - PANEL_PAD * 2, 28, MUTED, 15);
-    Text(dc, L"运行日志：" + to_ws(snapTopS("log")), rx + PANEL_PAD, resTop + 112,
-         rightW - PANEL_PAD * 2, 28, MUTED, 15);
+    int resTop = g.top + g.connH + PANEL_GAP, resH = g.infoH - g.connH - PANEL_GAP;
+    Panel(dc, g.rx, resTop, g.rightW, resH);
+    Text(dc, L"设备资源", g.rx + PANEL_PAD, resTop + 6, 300, 34, INK, 24, true);
+    int resW = g.rightW - PANEL_PAD * 2;
+    Text(dc, L"内部存储 / 运行内存 / 电池", g.rx + PANEL_PAD, resTop + 46, resW, 26, MUTED, 15);
+    Text(dc, L"未接入（协议未确认）", g.rx + PANEL_PAD, resTop + 72, resW, 26, MUTED, 15);
+    Text(dc, L"审计日志：" + to_ws(snapTopS("jsonl")), g.rx + PANEL_PAD, resTop + 106,
+         resW, 24, MUTED, 14);
+    Text(dc, L"运行日志：" + to_ws(snapTopS("log")), g.rx + PANEL_PAD, resTop + 132,
+         resW, 24, MUTED, 14);
 
-    // 快捷操作 + 运行开关
-    int cTop = top + infoH + 18, cH = h - cTop - 10;
-    int blW = (w - MARGIN * 2 - 20) / 2;
-    Panel(dc, MARGIN, cTop, blW, cH);
-    Text(dc, L"快捷操作", MARGIN + PANEL_PAD, cTop + 8, 200, 36, INK, 24, true);
-    // 按钮由子窗口实现（见 CreateButtons），这里只画面板底色
+    // 底部：快捷操作（左）+ 运行开关（右）
+    Panel(dc, g.x0 + MARGIN, g.cTop, g.blW, g.cH);
+    Text(dc, L"快捷操作", g.x0 + MARGIN + PANEL_PAD, g.cTop + 6, 300, 34, INK, 24, true);
+    // 按钮由子窗口实现（见 CreateHomeControls），这里只画面板底色
 
-    int ctlX = MARGIN + blW + 20;
-    Panel(dc, ctlX, cTop, w - MARGIN - ctlX, cH);
-    Text(dc, L"运行开关", ctlX + PANEL_PAD, cTop + 8, 200, 36, INK, 24, true);
+    Panel(dc, g.ctlX, g.cTop, g.ctlW, g.cH);
+    Text(dc, L"运行开关", g.ctlX + PANEL_PAD, g.cTop + 6, 300, 34, INK, 24, true);
 
-    // 速度档（－ 值 ＋）只读显示 + 速度标签
-    if (g_speedRect.right > g_speedRect.left) {
-        std::wstring sv = fmt(L"%d 档", snapI("cfg", "speed", 3));
-        Text(dc, L"速度", g_speedRect.left - 46, g_speedRect.top, 44, 30, INK, 16, true);
-        Text(dc, sv, g_speedRect.left, g_speedRect.top,
-             g_speedRect.right - g_speedRect.left, g_speedRect.bottom - g_speedRect.top,
-             PURPLE_DARK, 18, true, DT_CENTER);
-    }
+    // 速度档（－ 值 ＋）+ 字间距 / Z 偏移标签（与控件对齐，坐标同源）
+    Text(dc, L"速度档", g.spdX, g.rowY[0], g.lblW, 28, INK, 16, true);
+    Text(dc, L"字间距", g.spdX, g.rowY[1], g.lblW, 26, INK, 16, true);
+    Text(dc, L"Z 偏移", g.spdX, g.rowY[2], g.lblW, 26, INK, 16, true);
+    Text(dc, fmt(L"%d", snapI("cfg", "speed", 3)),
+         g_speedRect.left, g_speedRect.top, g_speedRect.right - g_speedRect.left, 28,
+         PURPLE_DARK, 18, true, DT_CENTER);
 }
 
 static void DrawConnect(HDC dc, RECT& rc) {
-    int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    int top = 78;
-    int half = (w - MARGIN * 2 - 18) / 2;
+    TwoColGeo g = TwoColLayout(rc, CONNECT_PANEL_H);
 
-    Panel(dc, MARGIN, top, half, 300);
-    Text(dc, L"串口连接", MARGIN + PANEL_PAD, top + 8, 200, 36, INK, 24, true);
-    int bx = MARGIN + PANEL_PAD, bw = half - PANEL_PAD * 2;
-    // 下拉/按钮均为子窗口控件，在此只留位
-    (void)bx; (void)bw;
+    Panel(dc, g.leftX, g.top, g.colW, g.panelH);
+    Text(dc, L"串口连接", g.innerX, g.top + 6, 300, 34, INK, 24, true);
+    // 串口下拉框与按钮为子窗口控件（见 CreateConnectControls），此处补静态标签
+    Text(dc, L"协议固定：9600 / Even / 8 / 1（RS485 · Modbus RTU）",
+         g.innerX, g.top + 196, g.innerW, 24, MUTED, 14);
 
-    int dx = MARGIN + half + 18;
-    Panel(dc, dx, top, half, 300);
-    Text(dc, L"连接诊断", dx + PANEL_PAD, top + 8, 200, 36, INK, 24, true);
+    Panel(dc, g.rightX, g.top, g.colW, g.panelH);
+    Text(dc, L"连接诊断", g.rightX + PANEL_PAD, g.top + 6, 300, 34, INK, 24, true);
     struct Diag { std::wstring v, k; COLORREF c; };
     bool conn = snapTop("connected"); bool dry = snapTop("dry_run");
     std::wstring ack = to_ws(snapS("comm", "ack"));
@@ -312,36 +431,39 @@ static void DrawConnect(HDC dc, RECT& rc) {
         { to_ws(snapS("comm", "at")).empty() ? L"—" : to_ws(snapS("comm", "at")), L"最近通信", MUTED },
         { to_ws(snapS("comm", "op")).empty() ? L"—" : to_ws(snapS("comm", "op")), L"最近操作", MUTED },
     };
+    int chipGap = 10;
+    int chipW = (g.innerW - chipGap * 2) / 3;
+    int chipH = 70;
     for (int i = 0; i < 6; ++i) {
-        int cx = dx + PANEL_PAD + (i % 3) * ((half - PANEL_PAD * 2) / 3);
-        int cy = top + 56 + (i / 3) * 92;
-        int cw = (half - PANEL_PAD * 2) / 3 - 10;
-        RECT chr{ cx, cy, cx + cw, cy + 82 };
+        int cx = g.rightX + PANEL_PAD + (i % 3) * (chipW + chipGap);
+        int cy = g.top + 50 + (i / 3) * (chipH + chipGap);
+        RECT chr{ cx, cy, cx + chipW, cy + chipH };
         FillRect(dc, &chr, g_brWhite);
-        rr(dc, chr.left, chr.top, cw, 82, 12, LINE);
-        Text(dc, ds[i].v, cx + 10, cy + 6, cw - 20, 34, ds[i].c, 20, true);
-        Text(dc, ds[i].k, cx + 10, cy + 40, cw - 20, 26, MUTED, 15);
+        rr(dc, chr.left, chr.top, chipW, chipH, 12, LINE);
+        Text(dc, ds[i].v, cx + 10, cy + 4, chipW - 20, 30, ds[i].c, 19, true);
+        Text(dc, ds[i].k, cx + 10, cy + 34, chipW - 20, 24, MUTED, 14);
     }
 
-    int noteTop = top + 300 + 18;
-    Panel(dc, MARGIN, noteTop, w - MARGIN * 2, 90);
-    RECT note{ MARGIN + PANEL_PAD, noteTop + 14, MARGIN + w - MARGIN * 2 - PANEL_PAD, noteTop + 82 };
+    int noteTop = g.top + g.panelH + PANEL_GAP;
+    int noteH = (g.y0 + g.H - 10) - noteTop;
+    if (noteH < 60) noteH = 60;
+    if (noteH > 72) noteH = 72;   // 说明条按内容高度收紧，避免整块空白
+    Panel(dc, g.x0 + MARGIN, noteTop, g.W - MARGIN * 2, noteH);
+    RECT note{ g.x0 + MARGIN + PANEL_PAD, noteTop + 12,
+               g.x0 + g.W - MARGIN - PANEL_PAD, noteTop + noteH - 12 };
     FillRect(dc, &note, g_brWarn);
     Text(dc, L"当前协议实现可记录 TX/RX 帧和 ACK 校验结果；尚未确认控制器是否提供独立状态、报警和真实坐标寄存器。",
          note.left + 10, note.top, note.right - note.left - 20, note.bottom - note.top, RGB(129, 87, 28), 16);
 }
 
 static void DrawWrite(HDC dc, RECT& rc) {
-    int w = rc.right - rc.left, h = rc.bottom - rc.top;
-    int top = 78;
-    int half = (w - MARGIN * 2 - 18) / 2;
+    TwoColGeo g = TwoColLayout(rc, WRITE_PANEL_H);
 
-    Panel(dc, MARGIN, top, half, 300);
-    Text(dc, L"输入与任务预检", MARGIN + PANEL_PAD, top + 8, 200, 36, INK, 24, true);
+    Panel(dc, g.leftX, g.top, g.colW, g.panelH);
+    Text(dc, L"输入与任务预检", g.innerX, g.top + 6, 300, 34, INK, 24, true);
 
-    int px = MARGIN + half + 18;
-    Panel(dc, px, top, half, 300);
-    Text(dc, L"任务进度", px + PANEL_PAD, top + 8, 200, 36, INK, 24, true);
+    Panel(dc, g.rightX, g.top, g.colW, g.panelH);
+    Text(dc, L"任务进度", g.rightX + PANEL_PAD, g.top + 6, 300, 34, INK, 24, true);
     struct S { std::wstring v, k; COLORREF c; };
     bool active = snapB("task", "active");
     S ss[5] = {
@@ -351,33 +473,42 @@ static void DrawWrite(HDC dc, RECT& rc) {
         { snapB("task", "pen_down") ? L"落笔" : L"抬笔", L"笔状态", snapB("task", "pen_down") ? DANGER : OK },
         { snapI("task", "dip_done") > 0 ? fmt(L"%d 次", snapI("task", "dip_done")) : (snapB("cfg", "enable_dip") ? L"未执行" : L"未启用"), L"蘸墨", INK },
     };
+    int chipGap = 8;
+    int chipW = (g.innerW - chipGap * 4) / 5;
+    int chipH = 64;
     for (int i = 0; i < 5; ++i) {
-        int cx = px + PANEL_PAD + i * ((half - PANEL_PAD * 2) / 5);
-        int cy = top + 56;
-        int cw = (half - PANEL_PAD * 2) / 5 - 10;
-        RECT chr{ cx, cy, cx + cw, cy + 72 };
+        int cx = g.rightX + PANEL_PAD + i * (chipW + chipGap);
+        int cy = g.top + 50;
+        RECT chr{ cx, cy, cx + chipW, cy + chipH };
         FillRect(dc, &chr, g_brWhite);
-        rr(dc, chr.left, chr.top, cw, 72, 12, LINE);
-        Text(dc, ss[i].v, cx + 8, cy + 4, cw - 16, 30, ss[i].c, 19, true);
-        Text(dc, ss[i].k, cx + 8, cy + 36, cw - 16, 24, MUTED, 14);
+        rr(dc, chr.left, chr.top, chipW, chipH, 12, LINE);
+        Text(dc, ss[i].v, cx + 8, cy + 2, chipW - 16, 28, ss[i].c, 17, true);
+        Text(dc, ss[i].k, cx + 8, cy + 30, chipW - 16, 22, MUTED, 13);
     }
-    // 预览区
-    int pvTop = top + 140, pvH = 300 - 56 - 72 - 12;
-    RECT pv{ px + PANEL_PAD, pvTop, px + half - PANEL_PAD, pvTop + pvH };
+
+    // 预览区（占满面板剩余高度）
+    int pvTop = g.top + 50 + chipH + 12;
+    int pvBot = g.top + g.panelH - PANEL_PAD;
+    if (pvBot - pvTop < 60) pvBot = pvTop + 60;
+    RECT pv{ g.rightX + PANEL_PAD, pvTop, g.rightX + g.colW - PANEL_PAD, pvBot };
     FillRect(dc, &pv, g_brSoft);
     HPEN pen = CreatePen(PS_SOLID, 2, RGB(185, 201, 219));
     HPEN op = (HPEN)SelectObject(dc, pen);
     SelectObject(dc, op);
-    int cxm = (pv.left + pv.right) / 2, cym = (pv.top + pv.bottom) / 2;
+    // 图形区避开底部提示行，否则弧线会压在提示文字上
+    int gfxTop = pv.top + 6, gfxBot = pv.bottom - 28;
+    if (gfxBot - gfxTop < 40) gfxBot = gfxTop + 40;
+    int cxm = (pv.left + pv.right) / 2, cym = (gfxTop + gfxBot) / 2;
+    int rh = (gfxBot - gfxTop) / 2, rw = rh * 7 / 6;
     MoveToEx(dc, pv.left + 6, cym, nullptr); LineTo(dc, pv.right - 6, cym);
-    MoveToEx(dc, cxm, pv.top + 6, nullptr); LineTo(dc, cxm, pv.bottom - 6);
+    MoveToEx(dc, cxm, gfxTop, nullptr); LineTo(dc, cxm, gfxBot);
     HPEN pp = CreatePen(PS_SOLID, 4, PURPLE);
     SelectObject(dc, pp);
-    Arc(dc, cxm - 70, cym - 60, cxm + 70, cym + 60, 0, 0, 0, 0);
+    Arc(dc, cxm - rw, cym - rh, cxm + rw, cym + rh, 0, 0, 0, 0);
     SelectObject(dc, op); DeleteObject(pp); DeleteObject(pen);
     // 蘸墨合规提示
     Text(dc, L"比赛要求：书法与国画均需自主蘸墨至少一次（运行开关可启用蘸墨）",
-         pv.left + 8, pv.bottom - 26, pv.right - pv.left - 16, 22, MUTED, 13);
+         pv.left + 8, pv.bottom - 24, pv.right - pv.left - 16, 20, MUTED, 13);
 }
 
 // ---------------- 导航 ----------------
@@ -474,9 +605,9 @@ static void OnPaint(HWND hwnd) {
     // 导航
     DrawNav(dc);
 
-    // 页面
+    // 页面（pageRc 与 Create*Controls 的 PageRectFromClient 完全一致）
     BuildInfoLines();   // ★每次绘制前重建信息行（快照由轮询/定时器更新）
-    RECT pageRc{ NAV_W + 8, TITLE_H + 4, w - 6, h - FOOTER_H };
+    RECT pageRc = PageRectFromClient(w, h);
     if (g_st.page == ID_PAGE_HOME)        DrawHome(dc, pageRc);
     else if (g_st.page == ID_PAGE_CONNECT) DrawConnect(dc, pageRc);
     else                                    DrawWrite(dc, pageRc);
@@ -516,17 +647,10 @@ static HWND MakeCheck(HWND parent, int id, const wchar_t* text, int x, int y, in
 }
 
 static void CreateHomeControls(HWND hwnd) {
-    // 布局与 DrawHome 一致：快捷操作按钮 + 运行开关复选
-    // 注意：窗口可缩放，控件布局必须用实际客户区宽度（与 WM_PAINT 的 pageRc 一致）
+    // 布局与 DrawHome 共用 HomeLayout()，保证面板与子控件严格对齐
     RECT crc; GetClientRect(hwnd, &crc);
-    int w = crc.right, h = crc.bottom;
-    int top = 78;
-    int leftW = (int)((w - NAV_W - 8 - MARGIN * 2 - 18) * 1.55 / 2.35);
-    int infoH = 318;
-    int cTop = top + infoH + 18, cH = h - FOOTER_H - cTop - 10;
-    int blW = (w - NAV_W - 8 - MARGIN * 2 - 20) / 2;
-    int bx = NAV_W + 8 + MARGIN, by = cTop + 56;
-    int bw = (blW - PANEL_PAD * 2 - 24) / 2;
+    HomeGeo g = HomeLayout(PageRectFromClient(crc.right, crc.bottom));
+
     struct B { const wchar_t* t; int id; } bs[] = {
         { L"⏻ 系统复位", IDC_BTN_RESET },
         { L"↕ 回中心点", IDC_BTN_CENTER },
@@ -538,96 +662,97 @@ static void CreateHomeControls(HWND hwnd) {
     };
     for (size_t i = 0; i < sizeof(bs) / sizeof(bs[0]); ++i) {
         MakeBtn(hwnd, { bs[i].t, bs[i].id, PURPLE },
-                 bx + (int)(i % 2) * (bw + 24), by + (int)(i / 2) * 62, bw, 46);
+                 g.btnX + (int)(i % 2) * (g.btnW + 24),
+                 g.btnY + (int)(i / 2) * BTN_PITCH, g.btnW, BTN_H);
     }
 
-    int ctlX = NAV_W + 8 + MARGIN + blW + 20;
-    int kx = ctlX + PANEL_PAD;
-    int ky = cTop + 56;
+    int kx = g.chkX, ky = g.cTop + 52;
     bool dry = snapTop("dry_run");
-    HWND c1 = MakeCheck(hwnd, IDC_CHECK_DRY, L"Dry Run（不连接真实串口）", kx, ky, 330, 30);
+    HWND c1 = MakeCheck(hwnd, IDC_CHECK_DRY, L"Dry Run（不连接真实串口）", kx, ky, g.chkW, CHK_H);
     SendMessage(c1, BM_SETCHECK, dry ? BST_CHECKED : BST_UNCHECKED, 0);
-    HWND c2 = MakeCheck(hwnd, IDC_CHECK_AUTODRAW, L"自动描边（写字完成后作画）", kx, ky + 34, 330, 30);
+    HWND c2 = MakeCheck(hwnd, IDC_CHECK_AUTODRAW, L"自动描边（写字完成后作画）", kx, ky + CHK_PITCH, g.chkW, CHK_H);
     SendMessage(c2, BM_SETCHECK, snapB("cfg", "auto_draw") ? BST_CHECKED : BST_UNCHECKED, 0);
-    HWND c3 = MakeCheck(hwnd, IDC_CHECK_HQ, L"高质模式（更慢更稳）", kx, ky + 68, 330, 30);
+    HWND c3 = MakeCheck(hwnd, IDC_CHECK_HQ, L"高质模式（更慢更稳）", kx, ky + CHK_PITCH * 2, g.chkW, CHK_H);
     SendMessage(c3, BM_SETCHECK, snapB("cfg", "high_quality") ? BST_CHECKED : BST_UNCHECKED, 0);
-    HWND c4 = MakeCheck(hwnd, IDC_CHECK_DIP, L"蘸墨功能", kx, ky + 102, 330, 30);
+    HWND c4 = MakeCheck(hwnd, IDC_CHECK_DIP, L"蘸墨功能", kx, ky + CHK_PITCH * 3, g.chkW, CHK_H);
     SendMessage(c4, BM_SETCHECK, snapB("cfg", "enable_dip") ? BST_CHECKED : BST_UNCHECKED, 0);
-    HWND c5 = MakeCheck(hwnd, IDC_CHECK_LOG, L"运行日志记录", kx, ky + 136, 330, 30);
+    HWND c5 = MakeCheck(hwnd, IDC_CHECK_LOG, L"运行日志记录", kx, ky + CHK_PITCH * 4, g.chkW, CHK_H);
     SendMessage(c5, BM_SETCHECK, snapB("cfg", "log") ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    // 速度 / 字间距 / Z 偏移（速度值显示区与标签）
-    int sx = kx + 340;
-    MakeBtn(hwnd, { L"－", IDC_BTN_SPEED_DEC, PURPLE }, sx, ky, 34, 30);
-    MakeBtn(hwnd, { L"＋", IDC_BTN_SPEED_INC, PURPLE }, sx + 196, ky, 34, 30);
-    g_speedRect = { sx + 38, ky, sx + 194, ky + 30 };
+    // 速度 ± / 字间距 / Z 偏移（标签由 DrawHome 绘制，坐标同源）
+    int sx = g.spdX;
+    MakeBtn(hwnd, { L"－", IDC_BTN_SPEED_DEC, PURPLE }, sx + g.lblW + 4, g.rowY[0], g.pbtnW, 28);
+    MakeBtn(hwnd, { L"＋", IDC_BTN_SPEED_INC, PURPLE },
+            sx + g.lblW + 4 + g.pbtnW + g.valW, g.rowY[0], g.pbtnW, 28);
+    g_speedRect = { sx + g.lblW + 4 + g.pbtnW, g.rowY[0], sx + g.lblW + 4 + g.pbtnW + g.valW, g.rowY[0] + 28 };
     g_editSpacing = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                    sx, ky + 68, 90, 30, hwnd, (HMENU)(INT_PTR)IDC_EDIT_SPACING, nullptr, nullptr);
+                                    sx + g.lblW + 4, g.rowY[1], g.editW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_SPACING, nullptr, nullptr);
     SendMessage(g_editSpacing, WM_SETFONT, (WPARAM)g_font16, TRUE);
-    MakeBtn(hwnd, { L"字间距 应用", IDC_BTN_SPACING_APPLY, PURPLE }, sx + 100, ky + 68, 130, 30);
+    SetWindowTextW(g_editSpacing, f1((float)snapD("cfg", "char_spacing", 1.0)).c_str());
+    MakeBtn(hwnd, { L"应用", IDC_BTN_SPACING_APPLY, PURPLE },
+            sx + g.lblW + 4 + g.editW + 6, g.rowY[1], g.applyW, 26);
     g_editZoff = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                 sx, ky + 106, 90, 30, hwnd, (HMENU)(INT_PTR)IDC_EDIT_ZOFF, nullptr, nullptr);
+                                 sx + g.lblW + 4, g.rowY[2], g.editW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_ZOFF, nullptr, nullptr);
     SendMessage(g_editZoff, WM_SETFONT, (WPARAM)g_font16, TRUE);
-    MakeBtn(hwnd, { L"Z偏移 应用", IDC_BTN_ZOFF_APPLY, PURPLE }, sx + 100, ky + 106, 130, 30);
+    SetWindowTextW(g_editZoff, f1((float)snapD("cfg", "z_offset", 0.0)).c_str());
+    MakeBtn(hwnd, { L"应用", IDC_BTN_ZOFF_APPLY, PURPLE },
+            sx + g.lblW + 4 + g.editW + 6, g.rowY[2], g.applyW, 26);
 }
 
 static void CreateConnectControls(HWND hwnd) {
     RECT crc; GetClientRect(hwnd, &crc);
-    int w = crc.right;
-    int top = 78;
-    int half = (w - NAV_W - 8 - MARGIN * 2 - 18) / 2;
-    int bx = NAV_W + 8 + MARGIN;
-    int bw = half - PANEL_PAD * 2;
+    TwoColGeo g = TwoColLayout(PageRectFromClient(crc.right, crc.bottom), CONNECT_PANEL_H);
 
     g_comboPort = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
-                                bx, top + 60, bw, 400, hwnd, (HMENU)(INT_PTR)IDC_COMBO_PORT, nullptr, nullptr);
+                                g.innerX, g.top + 46, g.innerW, 400, hwnd, (HMENU)(INT_PTR)IDC_COMBO_PORT, nullptr, nullptr);
     SendMessage(g_comboPort, WM_SETFONT, (WPARAM)g_font18, TRUE);
-    for (auto& p : gs::list_serial_ports()) {
+    auto ports = gs::list_serial_ports();
+    for (auto& p : ports) {
         std::wstring wp = to_ws(p);
         SendMessageW(g_comboPort, CB_ADDSTRING, 0, (LPARAM)wp.c_str());
     }
+    // 波特率/校验为协议已确认的固定值（9600/8E1），以静态文本提示，见 DrawConnect
 
-    int by = top + 110;
-    int bbw = (bw - 24) / 2;
-    MakeBtn(hwnd, { L"连接设备", IDC_BTN_CONNECT, TEAL }, bx, by, bbw, 46);
-    MakeBtn(hwnd, { L"断开连接", IDC_BTN_DISCONNECT, BLUE }, bx + bbw + 24, by, bbw, 46);
-    MakeBtn(hwnd, { L"刷新串口", IDC_BTN_REFRESH, BLUE }, bx, by + 62, bbw, 46);
-    MakeBtn(hwnd, { L"发送心跳", IDC_BTN_HEARTBEAT, PURPLE }, bx + bbw + 24, by + 62, bbw, 46);
+    int by = g.top + 100;
+    int bbw = (g.innerW - 24) / 2;
+    MakeBtn(hwnd, { L"连接设备", IDC_BTN_CONNECT, TEAL }, g.innerX, by, bbw, BTN_H);
+    MakeBtn(hwnd, { L"断开连接", IDC_BTN_DISCONNECT, BLUE }, g.innerX + bbw + 24, by, bbw, BTN_H);
+    MakeBtn(hwnd, { L"刷新串口", IDC_BTN_REFRESH, BLUE }, g.innerX, by + BTN_PITCH, bbw, BTN_H);
+    MakeBtn(hwnd, { L"发送心跳", IDC_BTN_HEARTBEAT, PURPLE }, g.innerX + bbw + 24, by + BTN_PITCH, bbw, BTN_H);
 
     // 提示文本（静态绘制）
 }
 
 static void CreateWriteControls(HWND hwnd) {
     RECT crc; GetClientRect(hwnd, &crc);
-    int w = crc.right;
-    int top = 78;
-    int half = (w - NAV_W - 8 - MARGIN * 2 - 18) / 2;
-    int bx = NAV_W + 8 + MARGIN;
-    int bw = half - PANEL_PAD * 2;
+    TwoColGeo g = TwoColLayout(PageRectFromClient(crc.right, crc.bottom), WRITE_PANEL_H);
 
     g_editText = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                  WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
-                                 bx, top + 56, bw, 96, hwnd, (HMENU)(INT_PTR)IDC_EDIT_TEXT, nullptr, nullptr);
+                                 g.innerX, g.top + 46, g.innerW, 84, hwnd, (HMENU)(INT_PTR)IDC_EDIT_TEXT, nullptr, nullptr);
     SendMessage(g_editText, WM_SETFONT, (WPARAM)g_font18, TRUE);
     std::string last = gs::load_last_task_text();
     if (!last.empty()) SetWindowTextW(g_editText, to_ws(last).c_str());
 
-    // 预检结果区（只读 EDIT）
-    g_editPreview = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                    WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
-                                    bx, top + 164, bw, 88, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PREVIEW, nullptr, nullptr);
-    SendMessage(g_editPreview, WM_SETFONT, (WPARAM)g_font16, TRUE);
-    SetWindowTextW(g_editPreview, L"点击“预检任务”查看字号、布局与速度估算。");
-
-    int by = top + 262;
-    int bbw = (bw - 24 * 2) / 3;
+    int y = g.top + 46 + 84 + 12;
+    int bbw = (g.innerW - 24 * 2) / 3;
     struct B { const wchar_t* t; int id; } bs[] = {
         { L"预检任务", IDC_BTN_QUERY },
         { L"开始书写", IDC_BTN_WRITE },
         { L"停止任务", IDC_BTN_STOP },
     };
     for (size_t i = 0; i < 3; ++i)
-        MakeBtn(hwnd, { bs[i].t, bs[i].id, PURPLE }, bx + (int)i * (bbw + 24), by, bbw, 46);
+        MakeBtn(hwnd, { bs[i].t, bs[i].id, PURPLE }, g.innerX + (int)i * (bbw + 24), y, bbw, BTN_H);
+
+    // 预检结果区（只读 EDIT）
+    int prevTop = y + BTN_H + 12;
+    int prevH = g.top + g.panelH - PANEL_PAD - prevTop;
+    if (prevH < 48) prevH = 48;
+    g_editPreview = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                    WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+                                    g.innerX, prevTop, g.innerW, prevH, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PREVIEW, nullptr, nullptr);
+    SendMessage(g_editPreview, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editPreview, L"点击“预检任务”查看字号、布局与速度估算。");
 }
 
 // ---------------- 事件处理 ----------------
@@ -819,13 +944,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_checks[3]) SendMessage(g_checks[3], BM_SETCHECK, snapB("cfg", "enable_dip") ? BST_CHECKED : BST_UNCHECKED, 0);
             }
             s_lastTask = act;
-            // 速度/字间距输入框初值（仅一次）
-            static bool s_cfgInit = false;
-            if (!s_cfgInit) {
-                if (g_editSpacing) SetWindowTextW(g_editSpacing, f1((float)snapD("cfg", "char_spacing", 1.0)).c_str());
-                if (g_editZoff) SetWindowTextW(g_editZoff, f1((float)snapD("cfg", "z_offset", 0.0)).c_str());
-                s_cfgInit = true;
-            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
