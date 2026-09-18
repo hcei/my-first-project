@@ -23,6 +23,8 @@ Windows / C++17 / Modbus RTU over RS485 / nlohmann::json。
 - `origin` = https://github.com/hcei/my-first-project.git （本仓库），`upstream` = https://github.com/GuhuaiDawn/my-first-project.git （原作者）。
 - 功能开发走新分支再推送，不直接推 `main`；本次 GUI 工作分支：`feat/gui-win32-assistant`。
 - `gh` CLI 已登录（账号 hcei，https 协议）。
+- **推送需要走本机代理**：`git push` 直连 github.com 会 `Recv failure: Connection was reset`；本机浏览器代理为 `127.0.0.1:7897`（WinINET 里 ProxyEnable=1），但 git/curl 不会自动使用它，WinHTTP 显示“直接访问”。可用一次性参数推送，不必写进 git 配置：
+  `git -c http.proxy=http://127.0.0.1:7897 push -u origin <branch>`
 
 ## 关键约定
 优先复用现有 C++ 控制流程；不得把协议假设当成已上机验证事实；涉及硬件运动必须先空载、限位和急停验证。原 CR-3040/G-code 方案仅作为需求和流程参考，不直接继承其机械、电控或夹具设计。
