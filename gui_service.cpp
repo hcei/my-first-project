@@ -42,6 +42,11 @@ FILE*       g_jsonl   = nullptr;
 SerialPort  g_port;
 std::string g_port_name;               // 用户输入形式（如 COM3）
 
+// 异步连接状态（open 在工作线程执行，避免 UI 线程内核阻塞）
+std::atomic_bool g_connect_pending{ false };   // 工作线程正在打开串口
+std::string      g_connect_state = "idle";     // idle/connecting/ok/fail（g_mu 保护）
+std::string      g_connect_msg;                // 结果文本 UTF-8（g_mu 保护）
+
 // 通信统计
 std::string g_last_tx, g_last_rx;      // hex 大写带空格
 std::string g_last_ack;                // valid / invalid / none
@@ -326,6 +331,10 @@ json snapshot() {
         j["protocol"] = "RS485 / Modbus RTU";
         j["params"] = "9600 / 8E1";
     }
+    j["connect"] = json{
+        { "pending", (bool)g_connect_pending },
+        { "state", g_connect_state },
+        { "message", g_connect_msg } };
     j["pose"] = json{ { "x", g_last_pose.x }, { "y", g_last_pose.y }, { "z", g_last_pose.z },
                       { "pen_down", g_last_pose.isPenDown },
                       { "valid", g_pose_init }, { "ts", g_pose_ts } };
@@ -409,23 +418,47 @@ std::vector<std::string> list_serial_ports() {
     return std::vector<std::string>(out.begin(), out.end());
 }
 
-bool connect(const std::string& port_name, std::string& err) {
-    std::lock_guard<std::recursive_mutex> lk(g_mu);
-    if (g_task_active) { err = "任务运行中，禁止修改连接"; return false; }
-    session_id();
-    if (g_port.is_open()) g_port.close();
-
-    g_port_name = port_name;
-    bool ok = g_port.open(normalizeComName(utf8_to_w(port_name)), BAUDRATE, EVENPARITY, 8, ONESTOPBIT);
-    json ev = op_event("connect", nullptr);
-    ev["parameters"] = { { "port", port_name }, { "params", "9600/8E1" } };
-    ev["result"] = ok ? "ok" : "fail";
-    if (!ok) ev["error_code"] = "open_failed";
-    audit_locked(ev);
-    if (ok) { g_consecutive_fail = 0; g_last_ack.clear(); g_last_comm = now_hms(); }
-    else err = "串口打开失败（端口不存在/被占用）";
-    return ok;
+// 异步连接：open（蓝牙虚拟口会在 CreateFileW 内核阻塞）放工作线程，打开期间不持 g_mu。
+void connect_async(const std::string& port_name) {
+    // 前置校验在 UI 线程持锁快速完成；open 与写结果分离，绝不跨 open 持锁。
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        if (g_task_active) {                       // 任务运行中禁止改连接，立即给失败结果
+            g_connect_pending = false;
+            g_connect_state = "fail";
+            g_connect_msg = "任务运行中，禁止修改连接";
+            return;
+        }
+        if (g_connect_pending) return;             // 已有连接建立中，忽略重复点击（防叠加挂起线程）
+        session_id();                              // 确保会话头（持锁调用）
+        g_connect_pending = true;
+        g_connect_state = "connecting";
+        g_connect_msg.clear();
+        g_port_name = port_name;                   // 先记录目标口，供面板显示“连接中”
+    }
+    std::thread([port_name]() {
+        // ★阻塞点：此处不持 g_mu，UI 线程与 500ms snapshot() 不受影响
+        bool ok = g_port.open(normalizeComName(utf8_to_w(port_name)),
+                              BAUDRATE, EVENPARITY, 8, ONESTOPBIT);
+        std::lock_guard<std::recursive_mutex> lk(g_mu);   // 仅记录结果/审计时持锁
+        json ev = op_event("connect", nullptr);
+        ev["parameters"] = { { "port", port_name }, { "params", "9600/8E1" } };
+        ev["result"] = ok ? "ok" : "fail";
+        if (!ok) ev["error_code"] = "open_failed";
+        audit_locked(ev);
+        if (ok) {
+            g_consecutive_fail = 0; g_last_ack.clear(); g_last_comm = now_hms();
+            g_connect_state = "ok";
+            g_connect_msg = "已连接 " + port_name + "（9600/8E1）。";
+        } else {
+            g_port_name.clear();
+            g_connect_state = "fail";
+            g_connect_msg = "串口打开失败（端口不存在/被占用/蓝牙虚拟口不可连接）";
+        }
+        g_connect_pending = false;
+    }).detach();
 }
+bool connect_pending() { return g_connect_pending; }
 
 void disconnect() {
     std::lock_guard<std::recursive_mutex> lk(g_mu);

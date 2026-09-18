@@ -41,7 +41,7 @@ Windows / C++17 / Modbus RTU over RS485 / nlohmann::json。
 ## 串口枚举与端口打开（重要安全约定）
 - **枚举串口只许查询，不许打开**：`gs::list_serial_ports()` 仅用 `QueryDosDeviceW`（按 `ERROR_INSUFFICIENT_BUFFER` 扩容重试）+ 注册表 `HKLM\HARDWARE\DEVICEMAP\SERIALCOMM`。禁止用 `CreateFileW` 逐个探测——本机 6 个注册串口全是蓝牙虚拟串口（`\Device\BthModemN`），打开未连接的蓝牙口会在内核里阻塞（实测 COM4 5.2s、COM5 无限），而该函数由 UI 线程调用。
 - 本机环境：DOS 设备名列表约 47349 字符，4096 WCHAR 缓冲不够；串口为 COM3/4/5/6/8/9（全部 BthModem）。
-- 未修复的同类隐患：`gs::connect()` 仍在 UI 线程打开端口且期间持有 `g_mu`（见 bugs.md）。
+- 打开串口属同类风险：`gs::connect()` 已改为异步 `gs::connect_async()`——把 `SerialPort::open()`（蓝牙虚拟口会在 `CreateFileW` 内核无限阻塞）放到 detach 工作线程，**打开期间不持 `g_mu`**，结果经 `snapshot()["connect"]`（`pending`/`state`/`message`）由 UI `WM_TIMER` 轮询回报。**规则：任何串口 open 都不得在 UI 线程、也不得在持 `g_mu` 时进行**，否则一并冻结界面与 500ms `snapshot()`。
 
 ## 跨进程驱动 GUI 的安全边界（调试经验）
 - 可用：`PostMessage(hwnd, WM_COMMAND, id, 0)` —— 已用于预检 1009 / 开始书写 1013 / 停止 1014 / 急停 1011。

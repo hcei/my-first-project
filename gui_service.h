@@ -63,7 +63,10 @@ json snapshot();
 
 // ---------------- 串口连接 ----------------
 std::vector<std::string> list_serial_ports();
-bool connect(const std::string& port_name, std::string& err);
+// 异步连接：把可能无限阻塞的串口 open（蓝牙虚拟口在 CreateFileW 内核阻塞）放到工作线程，
+// 打开期间不持有 g_mu，UI 线程立即返回；结果经 snapshot()["connect"] 回报。
+void connect_async(const std::string& port_name);
+bool connect_pending();             // 是否仍有连接建立中
 void disconnect();
 bool is_connected();
 SerialPort& port();                 // 全进程唯一串口实例（控制台与 GUI 共用）

@@ -297,6 +297,10 @@ static std::string snapTopS(const char* key) {
     try { return g_st.snap.at(key).get<std::string>(); } catch (...) { return ""; }
 }
 
+// 异步连接观察标记：点击“连接设备”后置位，由 WM_TIMER 轮询 snapshot()["connect"]，
+// 待 pending 变 false 时刷新结果文本（open 在工作线程，UI 全程不阻塞）。
+static bool g_connWatching = false;
+
 // ---------------- 主页信息行构建 ----------------
 static void BuildInfoLines() {
     g_infoLines.clear();
@@ -587,9 +591,15 @@ static void DrawBtn(LPDRAWITEMSTRUCT di) {
 // ---------------- 主窗绘制 ----------------
 static void OnPaint(HWND hwnd) {
     PAINTSTRUCT ps;
-    HDC dc = BeginPaint(hwnd, &ps);
+    HDC screen = BeginPaint(hwnd, &ps);
     RECT crc; GetClientRect(hwnd, &crc);
     int w = crc.right, h = crc.bottom;
+
+    // ★双缓冲：全部绘制先画进内存位图，最后一次 BitBlt 上屏，消除 500ms 定时重绘造成的闪烁
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP hbmBuf = CreateCompatibleBitmap(screen, w, h);
+    HBITMAP hbmOld = (HBITMAP)SelectObject(dc, hbmBuf);
+
     RECT full{ 0, 0, w, h };
     FillRect(dc, &full, g_brBg);
 
@@ -623,6 +633,11 @@ static void OnPaint(HWND hwnd) {
          200, h - FOOTER_H, w - 400, FOOTER_H, MUTED, 15);
     Text(dc, estop ? L"急停" : L"GUI", w - 70, h - FOOTER_H, 60, FOOTER_H, estop ? DANGER : MUTED, 15, true);
 
+    // ★一次性上屏，释放双缓冲资源
+    BitBlt(screen, 0, 0, w, h, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, hbmOld);
+    DeleteObject(hbmBuf);
+    DeleteDC(dc);
     EndPaint(hwnd, &ps);
 }
 
@@ -774,8 +789,10 @@ static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
         if (sel == CB_ERR) { SetResult(L"请先选择串口。", true); return; }
         SendMessageW(g_comboPort, CB_GETLBTEXT, sel, (LPARAM)buf);
         gs::set_dry_run(false);
-        if (gs::connect(to_u8(buf), err)) SetResult(fmt(L"已连接 %s（9600/8E1）。", buf));
-        else SetResult(fmt(L"连接失败：%s", to_ws(err).c_str()), true);
+        // ★异步连接：open 在工作线程执行，UI 立即返回，不再因蓝牙虚拟口阻塞
+        gs::connect_async(to_u8(buf));
+        g_connWatching = true;
+        SetResult(fmt(L"正在连接 %s …", buf));
         break;
     }
     case IDC_BTN_DISCONNECT:
@@ -934,6 +951,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == IDT_TIMER) {
             g_st.snap = gs::snapshot();
+            // ★异步连接完成回报：pending 由 true 转 false 时刷新结果（UI 全程未阻塞）
+            if (g_connWatching && !snapB("connect", "pending")) {
+                g_connWatching = false;
+                std::string m = snapS("connect", "message");
+                std::string state = snapS("connect", "state");
+                SetResult(m.empty() ? L"连接已结束。" : to_ws(m), state == "fail");
+            }
             // 配置同步到复选框（任务后自动归位）
             static bool s_lastTask = false;
             bool act = snapB("task", "active");
@@ -1062,7 +1086,7 @@ int Run() {
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
 
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"书画机械臂调试助手",
-                              WS_OVERLAPPEDWINDOW,
+                              WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                               (ad.right - (wr.right - wr.left)) / 2, (ad.bottom - (wr.bottom - wr.top)) / 2,
                               wr.right - wr.left, wr.bottom - wr.top,
                               nullptr, nullptr, hInst, nullptr);
