@@ -364,27 +364,47 @@ json snapshot() {
 }
 
 // ---------------- 串口连接 ----------------
+// 串口枚举：只做查询，绝不打开端口。
+// 打开一个无响应的 COM 端口会让调用线程在内核里长时间阻塞（实测 COM4 阻塞 5s、COM5 无限阻塞），
+// 本函数在 GUI 中由 UI 线程调用，一旦阻塞整个界面就“未响应”，因此禁止用 CreateFile 探测。
+static bool comDigitsOk(const std::wstring& w) {
+    if (w.size() <= 3) return false;
+    for (size_t i = 3; i < w.size(); ++i)
+        if (w[i] < L'0' || w[i] > L'9') return false;
+    return true;
+}
 std::vector<std::string> list_serial_ports() {
     std::set<std::string> out;
-    WCHAR  names[4096];
-    DWORD  n = QueryDosDeviceW(nullptr, names, 4096);
-    if (n > 0 && n < 4096) {
-        const WCHAR* p = names;
+    // 1) DOS 设备名列表（纯查询；缓冲区不足时按需扩容重试）
+    std::vector<WCHAR> buf(8192);
+    DWORD n = 0;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        n = QueryDosDeviceW(nullptr, buf.data(), (DWORD)buf.size());
+        if (n > 0 && n < buf.size()) break;
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) { n = 0; break; }
+        buf.resize(buf.size() * 2);
+    }
+    if (n > 0) {
+        const WCHAR* p = buf.data();
         while (*p) {
             std::wstring w(p);
-            if (w.rfind(L"COM", 0) == 0) {
-                out.insert("COM" + std::to_string(_wtoi(w.c_str() + 3)));
-            }
+            if (w.rfind(L"COM", 0) == 0 && comDigitsOk(w)) out.insert("COM" + std::to_string(_wtoi(w.c_str() + 3)));
             p += w.size() + 1;
         }
     }
-    else {
-        for (int i = 1; i <= 32; ++i) {
-            std::wstring w = L"\\\\.\\COM" + std::to_wstring(i);
-            HANDLE h = CreateFileW(w.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                   OPEN_EXISTING, 0, nullptr);
-            if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); out.insert("COM" + std::to_string(i)); }
+    // 2) 注册表补充：部分虚拟串口不会出现在 DOS 设备列表中
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, KEY_READ, &k) == ERROR_SUCCESS) {
+        for (DWORD i = 0; ; ++i) {
+            WCHAR name[512]; BYTE data[512];
+            DWORD nl = 512, dl = sizeof(data), ty = 0;
+            if (RegEnumValueW(k, i, name, &nl, nullptr, &ty, data, &dl) != ERROR_SUCCESS) break;
+            if ((ty == REG_SZ || ty == REG_EXPAND_SZ) && dl >= sizeof(WCHAR)) {
+                std::wstring com((const WCHAR*)data);
+                if (com.rfind(L"COM", 0) == 0 && comDigitsOk(com)) out.insert("COM" + std::to_string(_wtoi(com.c_str() + 3)));
+            }
         }
+        RegCloseKey(k);
     }
     return std::vector<std::string>(out.begin(), out.end());
 }
