@@ -15,9 +15,11 @@
 #include <sstream>
 #include <thread>
 
-// —— 降采样步长（transmitTrajectoryWithSplit 当前使用等值字面量，变量保留以免行为差异） —— //
-static float RESAMPLE_STEP_MM_CALLI = 0.6f;
-static float RESAMPLE_STEP_MM_DRAW = 1.2f;
+// —— 降采样/抽稀步长 —— //
+// 方案B：书法段落笔点用 Ramer–Douglas–Peucker 按“最大弦高偏差”抽稀——
+//   直段塌成两端点（一笔到底、最顺滑），弯曲处自动保点以把几何误差限制在 RESAMPLE_DEV_MM_CALLI 内。
+static float RESAMPLE_DEV_MM_CALLI = 0.06f;  // 书法段 RDP 允许的最大垂直偏差(mm)，越小越保真
+static float RESAMPLE_STEP_MM_DRAW = 1.2f;   // 描边段沿用定步长抽稀（行为与修复前一致）
 
 // --------------------------- 过滤与降采样 ---------------------------
 // ★修复：书法区（原下标 < calli_end_src）去重间距由 1.5mm 收紧为 0.3mm——
@@ -54,6 +56,40 @@ void resamplePolyline(std::vector<Point>& pts, float minStep) {
     pts.swap(out);
 }
 
+// 方案B（误差有界的抽稀）：对一段落笔点做 Ramer–Douglas–Peucker。
+// 直段会被塌成两端点（一笔到底，最顺滑），弯曲处自动保留足够点，使“保留折线 vs 原始折线”的
+// 最大垂直偏差 ≤ tolMm，因此拐角与笔形不会丢失。用显式栈迭代，避免长笔画大点数时的深递归爆栈。
+void resamplePolylineRDP(std::vector<Point>& pts, float tolMm) {
+    size_t n = pts.size();
+    if (n <= 2) return;
+    auto perp = [](const Point& p, const Point& a, const Point& b) -> float {
+        float abx = b.x - a.x, aby = b.y - a.y;
+        float len2 = abx * abx + aby * aby;
+        if (len2 < 1e-12f) return std::hypot(p.x - a.x, p.y - a.y);
+        float t = ((p.x - a.x) * abx + (p.y - a.y) * aby) / len2;
+        t = std::min(1.f, std::max(0.f, t));
+        return std::hypot(p.x - (a.x + t * abx), p.y - (a.y + t * aby));
+        };
+    std::vector<char> keep(n, 0);
+    keep[0] = keep[n - 1] = 1;
+    std::vector<std::pair<size_t, size_t>> stack;
+    stack.emplace_back(0, n - 1);
+    while (!stack.empty()) {
+        size_t beg = stack.back().first, end = stack.back().second; stack.pop_back();
+        if (end <= beg + 1) continue;
+        const Point& A = pts[beg]; const Point& B = pts[end];
+        float maxd = -1.f; size_t idx = beg;
+        for (size_t i = beg + 1; i < end; ++i) {
+            float d = perp(pts[i], A, B);
+            if (d > maxd) { maxd = d; idx = i; }
+        }
+        if (maxd > tolMm) { keep[idx] = 1; stack.emplace_back(beg, idx); stack.emplace_back(idx, end); }
+    }
+    std::vector<Point> out; out.reserve(n);
+    for (size_t i = 0; i < n; ++i) if (keep[i]) out.push_back(pts[i]);
+    pts.swap(out);
+}
+
 // —— 节奏估时 —— //
 float speedLevelToXYmmPerSec(int level) {
     static const float table_normal[7] = { 0,40,60,80,110,140,180 };
@@ -61,11 +97,13 @@ float speedLevelToXYmmPerSec(int level) {
     level = std::max(SPEED_MIN, std::min(SPEED_MAX, level));
     return g_highQuality ? table_quality[level] : table_normal[level];
 }
-int get_Z_SETTLE_MS(bool isCalli) { return (g_highQuality && isCalli) ? 160 : Z_SETTLE_MS_BASE; }
-int get_STROKE_BEGIN_DWELL_MS(bool isCalli) { return (g_highQuality && isCalli) ? 110 : STROKE_BEGIN_DWELL_MS_BASE; }
-int get_STROKE_END_DWELL_MS(bool isCalli) { return (g_highQuality && isCalli) ? 120 : STROKE_END_DWELL_MS_BASE; }
+int get_Z_SETTLE_MS(bool isCalli) { return (!g_enableDunbi) ? 0 : ((g_highQuality && isCalli) ? 160 : g_z_settle_ms); }
+int get_STROKE_BEGIN_DWELL_MS(bool isCalli) { return (!g_enableDunbi) ? 0 : ((g_highQuality && isCalli) ? 110 : g_stroke_begin_ms); }
+int get_STROKE_END_DWELL_MS(bool isCalli) { return (!g_enableDunbi) ? 0 : ((g_highQuality && isCalli) ? 120 : g_stroke_end_ms); }
 int get_POINT_RATE_LIMIT_MS(bool isCalli) { return (g_highQuality && isCalli) ? 90 : POINT_RATE_LIMIT_MS_BASE; }
 
+// 方案A：返回相邻两条指令的“目标间隔”（运动时间 + 必要的物理停顿），
+// 不再是“发完后再额外 sleep 的时长”。串口往返与运动本身占用的墙钟时间由调用方补偿扣除。
 int estimateMoveMs(const Point& prev, const Point& cur, bool isCalli) {
     float vx = speedLevelToXYmmPerSec(cur.speed);
     float dx = cur.x - prev.x, dy = cur.y - prev.y;
@@ -79,8 +117,8 @@ int estimateMoveMs(const Point& prev, const Point& cur, bool isCalli) {
     if (zDownPrev && !zDownNow) extra += get_STROKE_END_DWELL_MS(isCalli);
     if (std::fabs(cur.z - prev.z) > 1.0f) extra += get_Z_SETTLE_MS(isCalli);
 
-    int base = std::max(get_POINT_RATE_LIMIT_MS(isCalli), t_xy);
-    base = std::max(base, DELAY_MS);
+    // 目标间隔 = max(最小节拍, 运动时间) + 物理停顿；不再叠加旧的 60ms 走停地板。
+    int base = std::max(g_min_point_interval_ms, t_xy);
     return base + extra;
 }
 
@@ -120,8 +158,8 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
     std::vector<size_t> srcIdx;
     std::vector<Point> filtered = filterDuplicatePoints(traj, &srcIdx, calli_end);
 
-    // 按段降采样：书法更密、描边稍稀（返回替换后该段的新点数，供修正分界）
-    auto resample_range = [&](size_t beg, size_t end, float step) -> size_t {
+    // 按段抽稀：书法段用 RDP(adaptive=true, param=容差mm)；描边段用定步长(adaptive=false, param=步长mm)
+    auto resample_range = [&](size_t beg, size_t end, bool adaptive, float param) -> size_t {
         if (end <= beg) return 0;
         size_t i = beg;
         std::vector<Point> out; out.reserve(end - beg + 16);
@@ -130,7 +168,7 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
             size_t j = i;
             std::vector<Point> seg;
             for (; j < end && filtered[j].isPenDown == pen; ++j) seg.push_back(filtered[j]);
-            if (pen) resamplePolyline(seg, step);
+            if (pen) { if (adaptive) resamplePolylineRDP(seg, param); else resamplePolyline(seg, param); }
             out.insert(out.end(), seg.begin(), seg.end());
             i = j;
         }
@@ -144,8 +182,8 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
     //        否则混合轨迹（前段书法+后段描边）会发生分界错位。
     calli_end = (size_t)(std::lower_bound(srcIdx.begin(), srcIdx.end(), calli_end) - srcIdx.begin());
     calli_end = std::min(calli_end, filtered.size());
-    if (calli_end > 0) calli_end = resample_range(0, calli_end, 0.6f);   // RESAMPLE_STEP_MM_CALLI（已定义为 0.6）
-    if (calli_end < filtered.size()) resample_range(calli_end, filtered.size(), 1.2f); // RESAMPLE_STEP_MM_DRAW（1.2）
+    if (calli_end > 0) calli_end = resample_range(0, calli_end, true, RESAMPLE_DEV_MM_CALLI);
+    if (calli_end < filtered.size()) resample_range(calli_end, filtered.size(), false, RESAMPLE_STEP_MM_DRAW);
 
     const float corner_theta_rad = 75.0f * 3.1415926f / 180.0f;
     const int   corner_dwell_ms = 40;
@@ -154,14 +192,29 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
     // 冷启动：本次调用开始时间
     auto t_start = std::chrono::steady_clock::now();
 
-    auto sleep_move = [&](const Point* prev, const Point& cur, bool isCalli) {
-        int ms = prev ? estimateMoveMs(*prev, cur, isCalli)
-            : std::max(get_POINT_RATE_LIMIT_MS(isCalli), DELAY_MS);
-        // 冷启动首秒强限速（设备刚“醒”时更保守）
-        auto ms_from_start = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t_start).count();
-        if (ms_from_start < 1000) ms = std::max(ms, 150);
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    // 方案A（节拍重整）：由“发完指令后再固定空等”改为“补偿式计时”——
+    // 串口往返与运动本身占用的墙钟时间计入指令间隔，只补睡到目标节拍，消除每点的死等。
+    auto ms_since = [](std::chrono::steady_clock::time_point a) -> long long {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - a).count();
+        };
+    // 目标指令间隔（含物理停顿 extra）；prev 为空表示无参考点（本段/本次首点）。
+    auto interval_for = [&](const Point* prev, const Point& cur, bool isCalli, int extra) -> int {
+        int base = prev ? estimateMoveMs(*prev, cur, isCalli) : g_min_point_interval_ms;
+        return base + extra;
+        };
+    // 从 t0（发送前时刻）补偿等待到目标间隔；冷启动首秒内给更保守的下限。
+    auto wait_after_send = [&](std::chrono::steady_clock::time_point t0, int interval_ms) {
+        if (ms_since(t_start) < 1000) interval_ms = std::max(interval_ms, g_cold_start_min_ms);
+        long long remain = (long long)interval_ms - ms_since(t0);
+        if (remain > 0) std::this_thread::sleep_for(std::chrono::milliseconds(remain));
+        };
+
+    // 命中停止（急停/停止任务都会置 g_estop）：按当前 XY 抬笔复位，避免笔尖停在纸面。
+    auto estopLiftAt = [&](const Point& cur) {
+        wprintln(L"[急停] 停止。抬笔复位。");
+        Point up = cur; up.z = Z_UP; up.isPenDown = false; up.zType = "UP-ESTOP";
+        sp.sendPointRetry(up);
         };
 
     const Point* lastSent = nullptr;
@@ -171,19 +224,15 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
     while (i < filtered.size()) {
         bool inCalli = (i < calli_end);
 
-        if (g_estop) {
-            wprintln(L"[急停] 停止。抬笔复位。");
-            Point up = filtered[i]; up.z = Z_UP; up.isPenDown = false; up.zType = "UP-ESTOP";
-            sp.sendPointRetry(up);
-            return false;
-        }
+        if (g_estop) { estopLiftAt(filtered[i]); return false; }
 
         if (!filtered[i].isPenDown) {
             // 抬笔段：逐点发送（用于定位）
             const Point& p = filtered[i];
+            auto t0 = std::chrono::steady_clock::now();
             if (!sp.sendPointRetry(p)) return false;
             gs::task::traj_add_done(1, false);   // ★GUI 钩子：轨迹点进度
-            sleep_move(lastSent, p, inCalli);
+            wait_after_send(t0, interval_for(lastSent, p, inCalli, 0));
             lastSent = &filtered[i];
             ++i;
             continue;
@@ -196,13 +245,15 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
 
             for (size_t k = i; k < j; ++k) {
                 const Point& p = filtered[k];
+                if (g_estop) { estopLiftAt(p); return false; }   // ★逐点轮询：一笔之内也能停
 
-                // 首落笔加固：检测“由抬到落”的第一个点，且尚未加固过
-                bool isFirstDownThisCall = (!firstDownDuplicated) && ((k == 0) || !filtered[k - 1].isPenDown);
+                // 首落笔加固：检测“由抬到落”的第一个点，且尚未加固过（关闭顿笔时跳过此重压加固）
+                bool isFirstDownThisCall = g_enableDunbi && (!firstDownDuplicated) && ((k == 0) || !filtered[k - 1].isPenDown);
                 if (isFirstDownThisCall) {
                     // 第一次落笔：重复发送两次，中间停顿；再额外沉稳
+                    auto t0 = std::chrono::steady_clock::now();
                     if (!sp.sendPointRetry(p)) return false;
-                    sleep_move(lastSent, p, true);
+                    wait_after_send(t0, interval_for(lastSent, p, true, 0));
                     std::this_thread::sleep_for(std::chrono::milliseconds(FIRST_DOWN_DUP_SEND_PAUSE));
 
                     if (!sp.sendPointRetry(p)) return false;
@@ -217,17 +268,19 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
                     continue;
                 }
 
+                auto t0 = std::chrono::steady_clock::now();
                 if (!sp.sendPointRetry(p)) return false;
                 gs::task::traj_add_done(1, true);       // ★GUI 钩子：书法逐点进度
 
-                // 角点轻微停顿
+                // 角点额外停顿：折进本点指令间隔（补偿式，不再叠加在串口耗时之上）
+                int corner_extra = 0;
                 if (k >= 1 && k + 1 < j) {
                     float ang = angle_between(filtered[k - 1], filtered[k], filtered[k + 1]);
-                    if (ang > corner_theta_rad) std::this_thread::sleep_for(std::chrono::milliseconds(hard_corner_ms));
-                    else if (ang > corner_theta_rad * 0.6f) std::this_thread::sleep_for(std::chrono::milliseconds(corner_dwell_ms));
+                    if (ang > corner_theta_rad) corner_extra = hard_corner_ms;
+                    else if (ang > corner_theta_rad * 0.6f) corner_extra = corner_dwell_ms;
                 }
 
-                sleep_move(lastSent, p, true);
+                wait_after_send(t0, interval_for(lastSent, p, true, corner_extra));
                 lastSent = &filtered[k];
             }
             i = j; // 下一段
@@ -237,23 +290,27 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
             size_t j = i; while (j < filtered.size() && filtered[j].isPenDown) ++j; // [i,j)
             size_t len = j - i, k = 0;
             while (k < len) {
+                if (g_estop) { estopLiftAt(filtered[i + k]); return false; }   // ★逐块轮询：描边段也能停
                 size_t chunk = std::min<size_t>(7, len - k);
                 std::vector<Point> batch(filtered.begin() + i + k, filtered.begin() + i + k + chunk);
 
+                auto t0batch = std::chrono::steady_clock::now();
                 if (!sp.sendPointsBatch7(batch)) {
                     // 回退逐点 —— 用 filtered 的下标，保证 lastSent 指针稳定
                     for (size_t t = 0; t < batch.size(); ++t) {
                         const Point& p_ref = filtered[i + k + t];  // 指向 filtered 中的真实元素
+                        if (g_estop) { estopLiftAt(p_ref); return false; }
+                        auto t0 = std::chrono::steady_clock::now();
                         if (!sp.sendPointRetry(p_ref)) return false;
                         gs::task::traj_add_done(1, true);           // ★GUI 钩子：回退逐点进度
-                        sleep_move(lastSent, p_ref, false);
+                        wait_after_send(t0, interval_for(lastSent, p_ref, false, 0));
                         lastSent = &p_ref;                          // 指向稳定存储
                     }
                 }
                 else {
                     const Point& plast = filtered[i + k + chunk - 1];
                     gs::task::traj_add_done(chunk, true);           // ★GUI 钩子：批量进度
-                    sleep_move(lastSent, plast, false);
+                    wait_after_send(t0batch, interval_for(lastSent, plast, false, 0));
                     lastSent = &plast;
                 }
                 k += chunk;

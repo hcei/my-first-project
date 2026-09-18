@@ -11,6 +11,9 @@ std::vector<Point> filterDuplicatePoints(const std::vector<Point>& in,
                                          std::vector<size_t>* srcIndex = nullptr,
                                          size_t calli_end_src = 0);
 void resamplePolyline(std::vector<Point>& pts, float minStep);
+// 方案B：Ramer–Douglas–Peucker 抽稀——在“保留折线 vs 原始折线”最大垂直偏差 ≤ tolMm 的前提下
+// 去除直段冗余点（直段塌成两端点、弯曲与拐角保点）。用迭代实现，避免长笔画大点数深递归。
+void resamplePolylineRDP(std::vector<Point>& pts, float tolMm);
 
 // —— 节奏估时 —— //
 float speedLevelToXYmmPerSec(int level);
@@ -18,6 +21,8 @@ int get_Z_SETTLE_MS(bool isCalli);
 int get_STROKE_BEGIN_DWELL_MS(bool isCalli);
 int get_STROKE_END_DWELL_MS(bool isCalli);
 int get_POINT_RATE_LIMIT_MS(bool isCalli);
+// 方案A：返回相邻两条指令的“目标间隔”（运动时间 + 抬落笔/Z 沉降等物理停顿），
+// 不再是“发完后再额外 sleep 的时长”；串口与运动已消耗的墙钟时间由调用方补偿扣除。
 int estimateMoveMs(const Point& prev, const Point& cur, bool isCalli);
 
 // 角度

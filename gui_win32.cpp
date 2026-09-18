@@ -7,6 +7,7 @@
 //   书写：文本输入 + 预检 + 开始/停止 + 进度
 // 限制：单实例；任务运行时快捷操作与配置置灰；急停常驻可用。
 #include "gui_service.h"
+#include "gui_trail.h"
 
 #include <atomic>
 #include <chrono>
@@ -62,6 +63,7 @@ static const int INFO_LABEL_W = 88;    // 设备信息标签列宽（容纳 4 �
 static const int INFO_VALUE_DX = 94;   // 设备信息值列相对标签起点的偏移
 static const int CONNECT_PANEL_H = 246;// 连接页面板高度
 static const int WRITE_PANEL_H = 262;  // 书写页面板高度
+static const int PLANE_PANEL_H = 280;  // 书写平面页面板高度
 static const int BTN_H = 40, BTN_PITCH = 52;
 static const int CHK_H = 24, CHK_PITCH = 30;
 
@@ -181,9 +183,12 @@ enum {
     IDC_BTN_WRITE, IDC_BTN_STOP, IDC_EDIT_TEXT,
     IDC_BTN_SPEED_DEC, IDC_BTN_SPEED_INC, IDC_EDIT_SPACING, IDC_BTN_SPACING_APPLY,
     IDC_BTN_ZOFF_APPLY, IDC_EDIT_ZOFF,
-    IDC_CHECK_DRY, IDC_CHECK_AUTODRAW, IDC_CHECK_HQ, IDC_CHECK_DIP, IDC_CHECK_LOG,
+    IDC_CHECK_DRY, IDC_CHECK_AUTODRAW, IDC_CHECK_HQ, IDC_CHECK_DIP, IDC_CHECK_LOG, IDC_CHECK_DUNBI,
     IDC_EDIT_PREVIEW,
-    ID_PAGE_HOME = 2001, ID_PAGE_CONNECT, ID_PAGE_WRITE,
+    IDC_EDIT_PAPERW, IDC_EDIT_PAPERH, IDC_EDIT_PDX, IDC_EDIT_PDY,
+    IDC_BTN_PAPER_APPLY, IDC_BTN_PAPER_RECAL,
+    IDC_EDIT_PLANE_Z, IDC_BTN_PLANE_PREVIEW, IDC_BTN_PLANE_SAVE,
+    ID_PAGE_HOME = 2001, ID_PAGE_CONNECT, ID_PAGE_WRITE, ID_PAGE_PLANE,
     IDT_TIMER = 3001,
 };
 
@@ -208,8 +213,15 @@ static HWND g_editText = nullptr;
 static HWND g_editSpacing = nullptr;
 static HWND g_editZoff = nullptr;
 static HWND g_editPreview = nullptr;
+static HWND g_editPlaneZ = nullptr;      // 书写平面页：新 Z 输入框
 static HWND g_btns[64] = {};            // ID 映射辅助
 static HWND g_checks[16] = {};
+static HWND g_paperEdits[4] = {};       // 书写页纸张边界输入：宽/高/X微调/Y微调
+
+// ★实时轨迹面板：UI 侧显示缓冲 + 增量游标（epoch 变化表示任务已 reset，需全量重建）
+static std::vector<gs::trail::Cpt> g_dispCmd;
+static std::vector<gs::trail::Apt> g_dispAct;
+static uint64_t g_cmdCursor = 0, g_actCursor = 0, g_trailEpoch = 0;
 static RECT g_speedRect{};              // 主页速度档显示区
 static HFONT g_font18 = nullptr, g_fontBold20 = nullptr, g_font16 = nullptr;
 static HBRUSH g_brPanel = nullptr, g_brBg = nullptr, g_brTitle = nullptr, g_brFooter = nullptr,
@@ -460,6 +472,178 @@ static void DrawConnect(HDC dc, RECT& rc) {
          note.left + 10, note.top, note.right - note.left - 20, note.bottom - note.top, RGB(129, 87, 28), 16);
 }
 
+// ---------------- 书写页：实时轨迹面板 ----------------
+// 纸张边界输入项（标签文本），Draw 与 Create 共用同一份，避免文字漂移。
+static const wchar_t* PAPER_LABELS[4] = { L"纸宽(mm)", L"纸高(mm)", L"X 微调", L"Y 微调" };
+
+struct WritePlot {
+    int x, y, w, h;             // 轨迹面板整体（客户区坐标）
+    int ctrlY;                  // 控件行 y
+    int lblX[4], lblY, lblW[4];
+    int editX[4], editY, editW[4];
+    int applyX, btnY, applyW, recalX, recalW, btnH;
+    RECT plot;                  // 绘图区
+};
+
+// 轨迹面板几何：两块顶面板下方至页底的空白区，全部由此单一函数计算（绘制与控件同源）。
+static WritePlot WritePlotGeo(const RECT& rc) {
+    TwoColGeo g = TwoColLayout(rc, WRITE_PANEL_H);
+    WritePlot p{};
+    p.x = g.leftX;
+    p.y = g.top + g.panelH + PANEL_GAP;
+    p.w = g.W - MARGIN * 2;
+    p.h = (g.y0 + g.H - 10) - p.y;
+    if (p.h < 220) p.h = 220;                 // 窗口过矮时保底（宁可被底部裁切也不塌陷）
+    int pad = PANEL_PAD;
+    p.ctrlY = p.y + 42;
+    p.lblY = p.editY = p.ctrlY;
+    const int lw[4] = { 72, 72, 52, 52 };
+    const int ew[4] = { 62, 62, 52, 52 };
+    int cx = p.x + pad;
+    for (int i = 0; i < 4; ++i) {
+        p.lblX[i] = cx; p.lblW[i] = lw[i]; cx += lw[i] + 4;
+        p.editX[i] = cx; p.editW[i] = ew[i]; cx += ew[i] + 12;
+    }
+    p.btnH = 28; p.btnY = p.ctrlY - 1;
+    p.applyW = 84; p.applyX = cx; cx += p.applyW + 10;
+    p.recalW = 84; p.recalX = cx;
+    p.plot = RECT{ p.x + pad, p.ctrlY + 34, p.x + p.w - pad, p.y + p.h - pad };
+    return p;
+}
+
+// UI 线程增量取数；epoch 变化说明任务已 reset → 清空本地缓冲重新全量拉。
+static void RefreshTrail() {
+    uint64_t ep = gs::trail::epoch();
+    if (ep != g_trailEpoch) {
+        g_dispCmd.clear(); g_dispAct.clear();
+        g_cmdCursor = g_actCursor = 0; g_trailEpoch = ep;
+    }
+    g_cmdCursor = gs::trail::fetchCommanded(g_cmdCursor, g_dispCmd);
+    g_actCursor = gs::trail::fetchActual(g_actCursor, g_dispAct);
+}
+
+static void DrawTrailPanel(HDC dc, const WritePlot& p) {
+    Panel(dc, p.x, p.y, p.w, p.h);
+    Text(dc, L"实时轨迹", p.x + PANEL_PAD, p.y + 6, 200, 30, INK, 22, true);
+    for (int i = 0; i < 4; ++i)
+        Text(dc, PAPER_LABELS[i], p.lblX[i], p.lblY, p.lblW[i], 26, INK, 15, true);
+    // 输入框与按钮为子窗口（见 CreateWriteControls），此处只画标签与面板/绘图区。
+
+    RECT pr = p.plot;
+    FillRect(dc, &pr, g_brWhite);
+    rr(dc, pr.left, pr.top, pr.right - pr.left, pr.bottom - pr.top, 10, LINE);
+
+    // 世界坐标外接框：已下发点 ∪ 纸张（若有）
+    float minx, miny, maxx, maxy;
+    gs::trail::bounds(minx, miny, maxx, maxy);
+    gs::trail::PaperBox pb = gs::trail::paper();
+    if (pb.valid) {
+        minx = std::min(minx, pb.xmin()); maxx = std::max(maxx, pb.xmax());
+        miny = std::min(miny, pb.ymin()); maxy = std::max(maxy, pb.ymax());
+    }
+    const float MINSPAN = 20.f;
+    if (maxx - minx < MINSPAN) { float c = (minx + maxx) / 2; minx = c - MINSPAN / 2; maxx = c + MINSPAN / 2; }
+    if (maxy - miny < MINSPAN) { float c = (miny + maxy) / 2; miny = c - MINSPAN / 2; maxy = c + MINSPAN / 2; }
+    float ww = maxx - minx, wh = maxy - miny;
+
+    const int PAD = 18;
+    float availW = (float)(pr.right - pr.left) - PAD * 2; if (availW < 10) availW = 10;
+    float availH = (float)(pr.bottom - pr.top) - PAD * 2; if (availH < 10) availH = 10;
+    float s = std::min(availW / ww, availH / wh);
+    float baseX = pr.left + PAD + (availW - ww * s) / 2;
+    float baseY = pr.top + PAD + (availH - wh * s) / 2;
+    auto mapX = [&](float wx) { return (int)(baseX + (wx - minx) * s); };
+    auto mapY = [&](float wy) { return (int)(baseY + (maxy - wy) * s); };   // Y 轴向上
+
+    int saved = SaveDC(dc);
+
+    // 纸张矩形（若已设定）
+    if (pb.valid && pb.w > 0 && pb.h > 0) {
+        HPEN pnPaper = CreatePen(PS_DASH, 1, WARN);
+        HPEN old = (HPEN)SelectObject(dc, pnPaper);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, mapX(pb.xmin()), mapY(pb.ymax()), mapX(pb.xmax()), mapY(pb.ymin()));
+        SelectObject(dc, old); SelectObject(dc, ob); DeleteObject(pnPaper);
+        Text(dc, L"纸张", mapX(pb.xmin()) + 4, mapY(pb.ymax()) + 2, 80, 18, WARN, 12, true);
+    }
+    // 坐标原点十字（世界 0,0）
+    if (minx <= 0 && maxx >= 0 && miny <= 0 && maxy >= 0) {
+        HPEN pnAx = CreatePen(PS_DOT, 1, RGB(190, 200, 212));
+        HPEN old = (HPEN)SelectObject(dc, pnAx);
+        int ox = mapX(0), oy = mapY(0);
+        MoveToEx(dc, pr.left + 4, oy, nullptr); LineTo(dc, pr.right - 4, oy);
+        MoveToEx(dc, ox, pr.top + 4, nullptr);  LineTo(dc, ox, pr.bottom - 4);
+        SelectObject(dc, old); DeleteObject(pnAx);
+    }
+
+    size_t n = g_dispCmd.size();
+    if (n == 0) {
+        Text(dc, L"运行书写任务后，此处实时绘制机械臂已下发轨迹（紫色=落笔、灰线=抬笔移动、绿点=真机实测）。",
+             pr.left + 12, (pr.top + pr.bottom) / 2 - 10, pr.right - pr.left - 24, 24, MUTED, 15);
+    }
+    else {
+        // 抽稀索引，避免点数过多时每帧重绘成本过高
+        int stride = n > 6000 ? (int)(n / 6000) : 1;
+        std::vector<size_t> idx;
+        idx.reserve(n / stride + 1);
+        for (size_t i = 0; i < n; i += stride) idx.push_back(i);
+        if (idx.empty() || idx.back() != n - 1) idx.push_back(n - 1);
+
+        // 第一遍：抬笔移动（细灰线）
+        HPEN pnMove = CreatePen(PS_SOLID, 1, RGB(205, 210, 218));
+        HPEN op = (HPEN)SelectObject(dc, pnMove);
+        for (size_t k = 1; k < idx.size(); ++k) {
+            const auto& a = g_dispCmd[idx[k - 1]]; const auto& b = g_dispCmd[idx[k]];
+            if (a.pen && b.pen) continue;
+            MoveToEx(dc, mapX(a.x), mapY(a.y), nullptr); LineTo(dc, mapX(b.x), mapY(b.y));
+        }
+        SelectObject(dc, op); DeleteObject(pnMove);
+
+        // 第二遍：落笔轨迹（紫色粗线）
+        HPEN pnStroke = CreatePen(PS_SOLID, 2, PURPLE_DARK);
+        op = (HPEN)SelectObject(dc, pnStroke);
+        for (size_t k = 1; k < idx.size(); ++k) {
+            const auto& a = g_dispCmd[idx[k - 1]]; const auto& b = g_dispCmd[idx[k]];
+            if (!(a.pen && b.pen)) continue;
+            MoveToEx(dc, mapX(a.x), mapY(a.y), nullptr); LineTo(dc, mapX(b.x), mapY(b.y));
+        }
+        SelectObject(dc, op); DeleteObject(pnStroke);
+
+        // 真机实测点（绿点，稀疏）——与下发点的错位可暴露方向/丢步问题
+        HBRUSH brTeal = CreateSolidBrush(TEAL);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, brTeal);
+        HPEN on = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+        for (const auto& a : g_dispAct) {
+            int X = mapX(a.x), Y = mapY(a.y);
+            Ellipse(dc, X - 3, Y - 3, X + 4, Y + 4);
+        }
+        SelectObject(dc, on); SelectObject(dc, ob); DeleteObject(brTeal);
+
+        // 游标：最后一个已下发点（红圈）
+        const auto& c = g_dispCmd.back();
+        HPEN pnCur = CreatePen(PS_SOLID, 2, DANGER);
+        op = (HPEN)SelectObject(dc, pnCur);
+        ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+        int CX = mapX(c.x), CY = mapY(c.y);
+        Ellipse(dc, CX - 5, CY - 5, CX + 6, CY + 6);
+        SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(pnCur);
+    }
+
+    // 底部读数
+    std::wstring last = (n ? fmt(L"游标 X %s Y %s mm",
+                        FloatStr(g_dispCmd.back().x).c_str(), FloatStr(g_dispCmd.back().y).c_str())
+                           : std::wstring(L"游标 —"));
+    std::wstring act = g_dispAct.empty() ? std::wstring(L"实测 —")
+                        : fmt(L"实测 X %s Y %s mm",
+                              FloatStr(g_dispAct.back().x).c_str(), FloatStr(g_dispAct.back().y).c_str());
+    std::wstring extra = gs::trail::truncated() ? L"  （超上限，仅显示前段）" : L"";
+    Text(dc, fmt(L"%s　%s　|　已下发 %d 点　实测 %d 点%s",
+                 last.c_str(), act.c_str(), (int)n, (int)g_dispAct.size(), extra.c_str()),
+         pr.left + 12, pr.bottom - 24, pr.right - pr.left - 24, 20, MUTED, 13);
+
+    RestoreDC(dc, saved);
+}
+
 static void DrawWrite(HDC dc, RECT& rc) {
     TwoColGeo g = TwoColLayout(rc, WRITE_PANEL_H);
 
@@ -513,6 +697,50 @@ static void DrawWrite(HDC dc, RECT& rc) {
     // 蘸墨合规提示
     Text(dc, L"比赛要求：书法与国画均需自主蘸墨至少一次（运行开关可启用蘸墨）",
          pv.left + 8, pv.bottom - 24, pv.right - pv.left - 16, 20, MUTED, 13);
+
+    // ★实时轨迹面板（顶面板下方整宽区）
+    RefreshTrail();
+    DrawTrailPanel(dc, WritePlotGeo(rc));
+}
+
+static void DrawPlane(HDC dc, RECT& rc) {
+    TwoColGeo g = TwoColLayout(rc, PLANE_PANEL_H);
+
+    // 左面板：设置
+    Panel(dc, g.leftX, g.top, g.colW, g.panelH);
+    Text(dc, L"书写平面设置", g.innerX, g.top + 6, 360, 34, INK, 24, true);
+
+    bool pv = snapB("cfg", "writing_plane_valid");
+    float pz = (float)snapD("cfg", "writing_plane_z", 0.0);
+    float znorm = (float)snapD("cfg", "z_normal", -385.0);
+    std::wstring cur = pv
+        ? fmt(L"当前书写平面：Z = %s mm（已启用固定平面）", f1(pz).c_str())
+        : fmt(L"当前书写平面：未设定（沿用默认三层深度，常规落笔约 %s mm）", f1(znorm).c_str());
+    Text(dc, cur, g.innerX, g.top + 50, g.innerW, 26, pv ? OK : MUTED, 17);
+
+    // 新 Z 输入行（标签；输入框为子窗口，坐标见 CreatePlaneControls）
+    int lblY = g.top + 92;
+    Text(dc, L"新 Z (mm)：", g.innerX, lblY, 150, 28, INK, 17);
+
+    // 提示行（放在按钮行下方，避免与子窗口按钮重叠）
+    Text(dc, L"（悬停=移到 (0,0,Z) 目视确认；保存=固定后续书写深度并持久化）",
+         g.innerX, g.top + 176, g.innerW, 24, MUTED, 13);
+
+    // 右面板：说明
+    Panel(dc, g.rightX, g.top, g.colW, g.panelH);
+    Text(dc, L"说明", g.rightX + PANEL_PAD, g.top + 6, 200, 34, INK, 24, true);
+    std::wstring notes[5] = {
+        L"1. 书写平面即毛笔接触纸面的 Z 深度（数值越大越靠上）。",
+        L"2. 若当前书写平面低于桌面，把 Z 往上调（如 -385 → -365）。",
+        L"3. 先“模拟悬停”：机械臂移到 (0,0,Z) 停住，肉眼确认笔尖高度。",
+        L"4. 满意后“保存并应用”：后续所有书写在该固定 Z 执行，重启仍生效。",
+        L"5. Z 受设备行程限制（约 -320~-410，含偏移），越界会被拒绝。",
+    };
+    int ny = g.top + 50;
+    for (int i = 0; i < 5; ++i) {
+        Text(dc, notes[i], g.rightX + PANEL_PAD, ny, g.colW - PANEL_PAD * 2, 34, INK, 15);
+        ny += 40;
+    }
 }
 
 // ---------------- 导航 ----------------
@@ -520,8 +748,9 @@ static const struct { const wchar_t* icon; const wchar_t* name; int id; } NAV[] 
     { L"⌂", L"主页",        ID_PAGE_HOME },
     { L"▣", L"设备连接",    ID_PAGE_CONNECT },
     { L"✎", L"书写任务",    ID_PAGE_WRITE },
+    { L"▤", L"书写平面",    ID_PAGE_PLANE },
 };
-static const int NAV_N = 3;
+static const int NAV_N = 4;
 
 static void DrawNav(HDC dc) {
     static HBRUSH brPurpleBar = CreateSolidBrush(PURPLE);
@@ -560,7 +789,7 @@ static void DrawBtn(LPDRAWITEMSTRUCT di) {
     COLORREF base = BLUE;
     if (slot >= 0 && slot < 64) {
         switch (GetDlgCtrlID(di->hwndItem)) {
-        case IDC_BTN_TESTPT: case IDC_BTN_CONNECT: case IDC_BTN_WRITE: base = TEAL; break;
+        case IDC_BTN_TESTPT: case IDC_BTN_CONNECT: case IDC_BTN_WRITE: case IDC_BTN_PLANE_PREVIEW: base = TEAL; break;
         case IDC_BTN_ESTOP: case IDC_BTN_STOP: base = DANGER; break;
         case IDC_BTN_DISCONNECT: case IDC_BTN_RESET: case IDC_BTN_CENTER:
         case IDC_BTN_REFRESH: case IDC_BTN_REFRESHDEV: base = BLUE; break;
@@ -620,7 +849,8 @@ static void OnPaint(HWND hwnd) {
     RECT pageRc = PageRectFromClient(w, h);
     if (g_st.page == ID_PAGE_HOME)        DrawHome(dc, pageRc);
     else if (g_st.page == ID_PAGE_CONNECT) DrawConnect(dc, pageRc);
-    else                                    DrawWrite(dc, pageRc);
+    else if (g_st.page == ID_PAGE_WRITE)   DrawWrite(dc, pageRc);
+    else                                   DrawPlane(dc, pageRc);
 
     // 底部状态栏
     RECT fr{ 0, h - FOOTER_H, w, h };
@@ -650,6 +880,8 @@ static void DestroyPageControls() {
     if (g_editSpacing) { DestroyWindow(g_editSpacing); g_editSpacing = nullptr; }
     if (g_editZoff) { DestroyWindow(g_editZoff); g_editZoff = nullptr; }
     if (g_editPreview) { DestroyWindow(g_editPreview); g_editPreview = nullptr; }
+    if (g_editPlaneZ) { DestroyWindow(g_editPlaneZ); g_editPlaneZ = nullptr; }
+    for (auto& e : g_paperEdits) if (e) { DestroyWindow(e); e = nullptr; }
 }
 
 static HWND MakeCheck(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
@@ -691,7 +923,9 @@ static void CreateHomeControls(HWND hwnd) {
     SendMessage(c3, BM_SETCHECK, snapB("cfg", "high_quality") ? BST_CHECKED : BST_UNCHECKED, 0);
     HWND c4 = MakeCheck(hwnd, IDC_CHECK_DIP, L"蘸墨功能", kx, ky + CHK_PITCH * 3, g.chkW, CHK_H);
     SendMessage(c4, BM_SETCHECK, snapB("cfg", "enable_dip") ? BST_CHECKED : BST_UNCHECKED, 0);
-    HWND c5 = MakeCheck(hwnd, IDC_CHECK_LOG, L"运行日志记录", kx, ky + CHK_PITCH * 4, g.chkW, CHK_H);
+    HWND c6 = MakeCheck(hwnd, IDC_CHECK_DUNBI, L"顿笔（起收笔按压·点画深压）", kx, ky + CHK_PITCH * 4, g.chkW, CHK_H);
+    SendMessage(c6, BM_SETCHECK, snapB("cfg", "enable_dunbi") ? BST_CHECKED : BST_UNCHECKED, 0);
+    HWND c5 = MakeCheck(hwnd, IDC_CHECK_LOG, L"运行日志记录", kx, ky + CHK_PITCH * 5, g.chkW, CHK_H);
     SendMessage(c5, BM_SETCHECK, snapB("cfg", "log") ? BST_CHECKED : BST_UNCHECKED, 0);
 
     // 速度 ± / 字间距 / Z 偏移（标签由 DrawHome 绘制，坐标同源）
@@ -768,6 +1002,42 @@ static void CreateWriteControls(HWND hwnd) {
                                     g.innerX, prevTop, g.innerW, prevH, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PREVIEW, nullptr, nullptr);
     SendMessage(g_editPreview, WM_SETFONT, (WPARAM)g_font16, TRUE);
     SetWindowTextW(g_editPreview, L"点击“预检任务”查看字号、布局与速度估算。");
+
+    // ★实时轨迹：纸张边界输入（宽/高/X微调/Y微调）+ 应用/重新校准（几何与 DrawTrailPanel 同源）
+    WritePlot wp = WritePlotGeo(PageRectFromClient(crc.right, crc.bottom));
+    const int pids[4] = { IDC_EDIT_PAPERW, IDC_EDIT_PAPERH, IDC_EDIT_PDX, IDC_EDIT_PDY };
+    gs::trail::PaperBox pb = gs::trail::paper();
+    const float pvals[4] = { pb.w, pb.h, pb.dx, pb.dy };
+    for (int i = 0; i < 4; ++i) {
+        HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                 wp.editX[i], wp.editY, wp.editW[i], 26, hwnd,
+                                 (HMENU)(INT_PTR)pids[i], nullptr, nullptr);
+        SendMessage(e, WM_SETFONT, (WPARAM)g_font16, TRUE);
+        if (pb.valid) SetWindowTextW(e, FloatStr(pvals[i]).c_str());
+        g_paperEdits[i] = e;
+    }
+    MakeBtn(hwnd, { L"应用边界", IDC_BTN_PAPER_APPLY, PURPLE }, wp.applyX, wp.btnY, wp.applyW, wp.btnH);
+    MakeBtn(hwnd, { L"重新校准", IDC_BTN_PAPER_RECAL, BLUE }, wp.recalX, wp.btnY, wp.recalW, wp.btnH);
+}
+
+static void CreatePlaneControls(HWND hwnd) {
+    RECT crc; GetClientRect(hwnd, &crc);
+    TwoColGeo g = TwoColLayout(PageRectFromClient(crc.right, crc.bottom), PLANE_PANEL_H);
+
+    // 新 Z 输入框（预填当前书写平面值）
+    g_editPlaneZ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                   WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                   g.innerX + 150, g.top + 92, 120, 26, hwnd,
+                                   (HMENU)(INT_PTR)IDC_EDIT_PLANE_Z, nullptr, nullptr);
+    SendMessage(g_editPlaneZ, WM_SETFONT, (WPARAM)g_font18, TRUE);
+    SetWindowTextW(g_editPlaneZ, f1((float)snapD("cfg", "writing_plane_z", -385.0)).c_str());
+
+    // 按钮行：模拟悬停 / 保存并应用
+    int y = g.top + 126;
+    int bbw = (g.innerW - 24) / 2;
+    MakeBtn(hwnd, { L"模拟悬停", IDC_BTN_PLANE_PREVIEW, TEAL }, g.innerX, y, bbw, BTN_H);
+    MakeBtn(hwnd, { L"保存并应用", IDC_BTN_PLANE_SAVE, PURPLE }, g.innerX + bbw + 24, y, bbw, BTN_H);
 }
 
 // ---------------- 事件处理 ----------------
@@ -879,6 +1149,20 @@ static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
         else SetResult(L"Z_OFFSET 输入无效（需 -100~100）。", true);
         break;
     }
+    case IDC_BTN_PLANE_PREVIEW: {
+        if (!g_editPlaneZ) { SetResult(L"书写平面输入框未就绪。", true); break; }
+        float z = (float)_wtof(GetEditW(g_editPlaneZ).c_str());
+        if (gs::preview_writing_plane(z, err)) SetResult(fmt(L"已移到 (0,0,%s) 悬停，请目视确认笔尖高度。", f1(z).c_str()));
+        else SetResult(fmt(L"悬停失败：%s", to_ws(err).c_str()), true);
+        break;
+    }
+    case IDC_BTN_PLANE_SAVE: {
+        if (!g_editPlaneZ) { SetResult(L"书写平面输入框未就绪。", true); break; }
+        float z = (float)_wtof(GetEditW(g_editPlaneZ).c_str());
+        if (gs::set_writing_plane(z, err)) { SetResult(fmt(L"书写平面已保存并应用：Z = %s mm（重启仍生效）。", f1(z).c_str())); InvalidateRect(hwnd, nullptr, FALSE); }
+        else SetResult(fmt(L"保存失败：%s", to_ws(err).c_str()), true);
+        break;
+    }
     case IDC_CHECK_DRY: {
         bool on = (SendMessage(g_checks[id - IDC_CHECK_DRY], BM_GETCHECK, 0, 0) == BST_CHECKED);
         if (!gs::set_dry_run(on)) {
@@ -894,10 +1178,38 @@ static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
         gs::toggle_high_quality(); SetResult(L"高质模式开关已切换。"); break;
     case IDC_CHECK_DIP:
         gs::toggle_enable_dip(); SetResult(L"蘸墨功能开关已切换。"); break;
+    case IDC_CHECK_DUNBI:
+        gs::toggle_enable_dunbi(); SetResult(L"顿笔开关已切换（关闭后仅写骨架）。"); break;
     case IDC_CHECK_LOG:
         gs::set_log_enable(SendMessage(g_checks[id - IDC_CHECK_DRY], BM_GETCHECK, 0, 0) == BST_CHECKED);
         SetResult(L"运行日志开关已切换。");
         break;
+    case IDC_BTN_PAPER_APPLY: {
+        float w  = (float)_wtof(GetEditW(g_paperEdits[0]).c_str());
+        float h  = (float)_wtof(GetEditW(g_paperEdits[1]).c_str());
+        float dx = (float)_wtof(GetEditW(g_paperEdits[2]).c_str());
+        float dy = (float)_wtof(GetEditW(g_paperEdits[3]).c_str());
+        if (!std::isfinite(w) || !std::isfinite(h) || w <= 0.f || h <= 0.f || w > 360.f || h > 360.f) {
+            SetResult(L"纸幅无效（宽/高需 0~360 mm，不超过设备行程）。", true); break;
+        }
+        if (!std::isfinite(dx)) dx = 0.f;
+        if (!std::isfinite(dy)) dy = 0.f;
+        gs::trail::PaperBox pb;
+        pb.cx = g_center_x; pb.cy = g_center_y; pb.w = w; pb.h = h; pb.dx = dx; pb.dy = dy; pb.valid = true;
+        gs::trail::setPaper(pb);
+        gs::cfg_save();
+        SetResult(fmt(L"纸张边界已应用（中心 %.0f,%.0f，%s×%s mm，微调 %s/%s）并保存。",
+                      g_center_x, g_center_y, f1(w).c_str(), f1(h).c_str(), f1(dx).c_str(), f1(dy).c_str()));
+        break;
+    }
+    case IDC_BTN_PAPER_RECAL: {
+        gs::trail::PaperBox pb; pb.valid = false;
+        gs::trail::setPaper(pb);
+        gs::cfg_save();
+        for (int i = 0; i < 4; ++i) if (g_paperEdits[i]) SetWindowTextW(g_paperEdits[i], L"");
+        SetResult(L"已清除纸张边界（改回按数据自动缩放）；换纸/挪位后重新输入并点“应用边界”。");
+        break;
+    }
     default: break;
     }
     InvalidateRect(hwnd, nullptr, FALSE);
@@ -966,6 +1278,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_checks[1]) SendMessage(g_checks[1], BM_SETCHECK, snapB("cfg", "auto_draw") ? BST_CHECKED : BST_UNCHECKED, 0);
                 if (g_checks[2]) SendMessage(g_checks[2], BM_SETCHECK, snapB("cfg", "high_quality") ? BST_CHECKED : BST_UNCHECKED, 0);
                 if (g_checks[3]) SendMessage(g_checks[3], BM_SETCHECK, snapB("cfg", "enable_dip") ? BST_CHECKED : BST_UNCHECKED, 0);
+                if (g_checks[5]) SendMessage(g_checks[5], BM_SETCHECK, snapB("cfg", "enable_dunbi") ? BST_CHECKED : BST_UNCHECKED, 0);
             }
             s_lastTask = act;
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -995,7 +1308,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     DestroyPageControls();
                     if (np == ID_PAGE_HOME) CreateHomeControls(hwnd);
                     else if (np == ID_PAGE_CONNECT) CreateConnectControls(hwnd);
-                    else CreateWriteControls(hwnd);
+                    else if (np == ID_PAGE_WRITE) CreateWriteControls(hwnd);
+                    else CreatePlaneControls(hwnd);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
                 return 0;
@@ -1019,7 +1333,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             DestroyPageControls();
             if (g_st.page == ID_PAGE_HOME) CreateHomeControls(hwnd);
             else if (g_st.page == ID_PAGE_CONNECT) CreateConnectControls(hwnd);
-            else CreateWriteControls(hwnd);
+            else if (g_st.page == ID_PAGE_WRITE) CreateWriteControls(hwnd);
+            else CreatePlaneControls(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;

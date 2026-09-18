@@ -83,3 +83,9 @@
 | 状态 | 描述 | 影响范围 | 复现步骤 |
 |------|------|----------|----------|
 | 已修复 2026-09-18 | 打开 GUI 后界面与文字持续闪烁。两处根因叠加：① `OnPaint` 把背景 `FillRect`、标题栏、导航、页面、页脚及全部 `Text()` 直接画在 `BeginPaint` 屏幕 DC 上，无双缓冲，而 500ms 定时器每次 `InvalidateRect(g_st.hwnd,nullptr,FALSE)` 全屏重绘 → 背景先闪再叠字；② 主窗口创建样式仅 `WS_OVERLAPPEDWINDOW`，缺 `WS_CLIPCHILDREN`，父窗全屏 `FillRect` 覆盖按钮/输入框/下拉框子控件区域，子控件随之重绘。修复：`OnPaint` 改双缓冲（`CreateCompatibleDC`+`CreateCompatibleBitmap` 画完后一次 `BitBlt` 上屏，并释放内存 DC/位图）；`CreateWindowW` 加 `WS_CLIPCHILDREN`。`WM_ERASEBKGND return 1` 与 FALSE 擦除本已正确，未动 | GUI 主页/设备连接/书写三页整体 | 打开 `RobotGUI.exe` 即见闪烁；`build.bat` 重编后 `--dryrun` 启动，`Responding=True`、收 `WM_CLOSE` 优雅退出，闪烁消除 |
+
+## 书写顿挫（写字一顿一顿，2026-09-18 修复，待上机确认）
+| 状态 | 描述 | 影响范围 | 复现步骤 |
+|------|------|----------|----------|
+| 已修复(离线) 2026-09-18 | 机械臂书写沿笔画一路“点刹”。根因：书法落笔段 `motion.cpp:transmitTrajectoryWithSplit` 为“逐点绝对定位 + 发完再 `sleep_move` 固定空等”，每点 `estimateMoveMs` 取 `max(POINT_RATE_LIMIT_MS=60, t_xy, DELAY=35)` 作为额外 sleep，叠加在 9600 串口单帧往返(~42ms)之上，而 ACK 只代表寄存器收到不代表到位——机械臂在每 0.6mm 途经点减速到停、干等、再起步。全项目原无任何插补/前瞻/轨迹缓冲 | 真机与 dryrun 书写节拍、观感与耗时（单字数千点→数分钟） | 修复：方案A 补偿式计时——`estimateMoveMs` 改为返回“相邻指令目标间隔”，去掉 60/35ms 走停地板（仅留 `MIN_POINT_INTERVAL_MS=12` 下限），发送循环用 `wait_after_send(t0,…)` 从发送前时刻补偿等待到目标间隔（串口+运动耗时计入），拐角停顿折进间隔；保留抬落笔/Z 沉降等物理停顿。方案B——书法落笔段用 `resamplePolylineRDP`（Ramer–Douglas–Peucker，容差 `RESAMPLE_DEV_MM_CALLI=0.06mm`）误差有界抽稀，直段塌成两端点、弯曲与拐角保点；描边段仍定步长 1.2。**已离线验证**（`build.bat` RC=0 + 单测）：直线 121→2 点偏差0；R2~200mm 弧最大偏差恒≤0.06且急弯更密；纯点间隔 60→12ms。**未验证(须上机)**：控制器对相邻指令是到点全停还是可运动中接新目标连续走/缓冲，决定 A 的顺滑上限；9600 单帧 ~22ms 为硬吞吐天花板；方案C（书法走 batch7 队列）待真机小样。上机前空载/限位/手触急停 |
+| 已否决 2026-09-18 | 方案B 曾用“转角自适应步长”（`resamplePolylineAdaptive`，按相邻点夹角在 min~max 取步长）：曲线探针证伪——HanziWriter 笔顺中线逐点转角极小，30mm 乃至 2mm 半径急弯的密采样点被判成“几乎直线”，仍按 ~2mm 大步长抽稀，会损失笔形保真 | 书写保真度 | 已删除该函数，改用误差有界的 RDP（方案B 现实现）。若日后要“直段稀疏+曲线致密”之外的需求，勿再走逐点夹角启发式，应以几何偏差为准 |

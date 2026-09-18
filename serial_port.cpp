@@ -284,3 +284,35 @@ bool SerialPort::sendPointsBatch7(const std::vector<Point>& pts7, int max_retrie
     wprintln(L"[错误] 批量发送连续失败，放弃该批。");
     return false;
 }
+
+// —— 0x03 读坐标：读 0x0008×5（X/Y/Z/A/V），返回 X/Y/Z（mm）——
+// 手册 6.1 读帧示例 01 03 00 08 00 05 04 0B；从机响应 [01,03,0A, Xh Xl Yh Yl Zh Zl Ah Al Vh Vl, CL CH] 共 15 字节。
+// 坐标以 0.1mm 编码（mm_to_dev10 的逆），故读回 ÷10 还原成 mm。
+bool SerialPort::readPose(float& x, float& y, float& z) {
+    if (g_dryRun) return false;                       // 无设备可读
+    if (h_ == INVALID_HANDLE_VALUE) return false;      // 未连接
+    // 请求帧：从机 + 0x03 + 起始(0x0008) + 个数(0x0005) + CRC
+    uint8_t req[8];
+    req[0] = MB_SLAVE; req[1] = 0x03;
+    req[2] = uint8_t(REG_START >> 8); req[3] = uint8_t(REG_START & 0xFF);
+    req[4] = uint8_t(REG_COUNT >> 8); req[5] = uint8_t(REG_COUNT & 0xFF);
+    uint16_t rc = crc16_modbus(req, 6);
+    req[6] = uint8_t(rc & 0xFF); req[7] = uint8_t((rc >> 8) & 0xFF);
+
+    PurgeComm(h_, PURGE_RXCLEAR);
+    if (!write(req, 8)) return false;
+    Sleep(10);
+
+    uint8_t rx[15] = { 0 };
+    if (!read_exact(rx, 15, 800)) return false;
+    if (rx[0] != MB_SLAVE || rx[1] != 0x03 || rx[2] != 0x0A) return false;   // 从机/功能码/字节数校验
+    uint16_t crc_calc = crc16_modbus(rx, 13);
+    uint16_t crc_rx = uint16_t(rx[13]) | (uint16_t(rx[14]) << 8);
+    if (crc_calc != crc_rx) return false;
+
+    auto rd16 = [&](int off) -> int16_t { return int16_t((uint16_t(rx[off]) << 8) | rx[off + 1]); };
+    x = rd16(3) / 10.0f;   // reg0 = X
+    y = rd16(5) / 10.0f;   // reg1 = Y
+    z = rd16(7) / 10.0f;   // reg2 = Z
+    return true;
+}

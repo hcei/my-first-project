@@ -90,9 +90,12 @@ json task_info();
 bool set_speed(int v);
 bool set_char_spacing(float v);
 bool set_z_offset(float v);
+bool preview_writing_plane(float z, std::string& err);  // 移到 (0,0,z) 悬停，确认书写高度（不书写）
+bool set_writing_plane(float z, std::string& err);      // 保存书写平面 Z：生效 + 持久化（后续书写统一用该 Z）
 void toggle_auto_draw();
 void toggle_high_quality();
 void toggle_enable_dip();
+void toggle_enable_dunbi();
 bool set_dry_run(bool on);          // 任务运行中返回 false
 void set_log_enable(bool on);
 

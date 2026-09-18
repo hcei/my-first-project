@@ -15,7 +15,7 @@ if not exist "%CXX%" (
 
 cd /d "%~dp0"
 
-set "COMMON=robot_common.cpp serial_port.cpp motion.cpp hanzi.cpp polyline.cpp gui_service.cpp"
+set "COMMON=robot_common.cpp serial_port.cpp motion.cpp hanzi.cpp polyline.cpp gui_service.cpp gui_trail.cpp"
 set "STD=-std=c++17 -g -Wall -Inlohmann -static -static-libgcc -static-libstdc++"
 
 if /i "%~1"=="clean" (

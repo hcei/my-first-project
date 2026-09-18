@@ -5,7 +5,19 @@
 > 出现阶段完成、方向变化、失败尝试、准备结束会话时，必须更新本文件。
 
 ## 当前任务
-Win32 原生版“书画机械臂调试助手”已实现；UI 布局缺陷与“切页卡死”均已修复并核验，使用说明已补齐，代码已推送分支 `feat/gui-win32-assistant`。下一步是合并/评审与真机验证准备。
+**（已实现·离线验证通过·待上机）GUI "书写平面"页**（与主页/设备连接/书写任务同级，专调落笔 Z）。解决"书写平面低于桌面"。实现：新全局 `g_writing_plane_z/g_writing_plane_valid` + `robot_config.json` 持久化 + `snapshot["cfg"]` 暴露；`hanzi.cpp` 落笔 `zdown = valid ? g_writing_plane_z : zFor(三层)`（未保存前行为不变）；服务层 `gs::preview_writing_plane`(移 (0,0,Z) 悬停)/`gs::set_writing_plane`(校验+置位+保存)；GUI `ID_PAGE_PLANE` 页含 当前Z显示 / 新Z输入框 / 模拟悬停 / 保存并应用。整合编译 RC=0；单元验证 PASS（设 -365→落笔全 -365、过渡点合法；未设→heavy/normal 分层）。Z 语义为 raw（不含 Z_OFFSET，发送时叠加）；改动文件：robot_common.{h,cpp}、hanzi.cpp、gui_service.{h,cpp}、gui_win32.cpp、robot_config.json。
+
+**（已归档、待上机）顺滑度方案 A/B + 逐点停止 + 节拍可配置 + dryrun 归因**
+- 方案A 补偿式计时（`estimateMoveMs` 语义改"目标指令间隔"、去 60/35ms 走停地板、`wait_after_send` 扣掉串口/运动耗时）。方案B RDP(0.06mm) 抽稀（`resamplePolylineRDP`，直段塌两端、弯曲保点）。逐点停止（`estopLiftAt`+书法逐点/描边批量/回退逐点三处 `g_estop` 轮询）。节拍参数运行期可配置（`z_settle_ms` 等 5 键，`gs::cfg_load` 覆盖全局）。整合编译 RC=0。
+- dryrun 归因（"书"，关描边）：prev 中位 186ms/min 62ms(地板钉死) → new 153ms/31ms → LOW 109ms/26%<50ms；顿挫大头是每笔起落 dwell+Z 沉降+冷启动，地板次之。RDP 对简单稀疏字不减点。字库缺失"找不到书.json"已定位非回归并派子代理下载 9574 字到 `D:/objects/hanzi-writer-data/data/`。
+- 上一轮 Win32 GUI 已完成，本轮不动既有三页布局。
+
+## 下一步 / 待办（新增或承接）
+- **速度编码疑似反向**：`serial_port.cpp` 发 `level-1` 与 `speedLevelToXYmmPerSec` 方向相反，手册 `00 最快`；上机先定真实"档→mm/s"方向再决定是否反转映射。
+- **auto_draw 描边走 `0x0064` 是抓放宏（手册明确）**：真机会把"画山水"当抓放动作，风险高。修：把描边发送路径由 `sendPointsBatch7` 改回逐点 `sendPointRetry`；在改完前保持 `auto_draw=false`。
+- **停止按钮 GUI 侧差异未定位**：静态看 `abort_task` 与 `request_estop` 都置 `g_estop`，用户报"停止没反应/急停有效"；上机若仍复现，看提示文本与 `task_abort` 事件确认是没触发还是段延迟。
+- **HanziWriter y 轴方向**：项目未翻转 y，若真机字上下颠倒，是翻转字形 y 的问题（`bugs.md` 有记）。
+- 上机阶段 3（判定控制器运动模型）由用户执行中。
 
 ## 成功标准
 `gui_win32.cpp` 三页（主页/设备连接/书写任务）可交互且版面正确（无字段溢出、无文字截断、无图形压字）；所有 GUI 操作经 `gs::` 服务层写入结构化 JSONL 审计（`source=GUI, actor=HUMAN`）；与控制台程序共用配置、运动安全校验和日志链路；未接入硬件状态显示为“未接入/协议待确认”。
@@ -46,6 +58,13 @@ Win32 原生版“书画机械臂调试助手”已实现；UI 布局缺陷与�
 - GUI 预检链路再次实测通过：切到书写页 → `PostMessage WM_COMMAND 1009` → 审计新增 `task_preflight result=ok`，`parameters.text="书"`、`source=GUI, actor=HUMAN, mode=DRYRUN`（`logs/audit_20260918_000443.jsonl` 等）。
 - 上一轮遗留的“预检报请先输入文本。”已定性：不是逻辑缺陷，而是**从非项目目录启动**导致 `last_task.txt` 按 CWD 解析读不到（详见 bugs.md 与 context.md）；同目录启动可正常预载“书”。
 
+### 书写顿挫修复（2026-09-18，方案A 补偿节拍 + 方案B RDP 抽稀）
+- 根因：书法落笔段是“逐点绝对定位 + 发完再固定空等”，每点 `sleep≥POINT_RATE_LIMIT_MS(60ms)` 叠加在 9600 串口单帧往返（~42ms）之上，且每个 0.6mm 途经点都是一次到点全停 → 沿笔画一路“点刹”。全项目原无插补/前瞻/缓冲。
+- 方案A（`motion.cpp` `estimateMoveMs` / `transmitTrajectoryWithSplit`）：`estimateMoveMs` 语义改为“相邻两指令的目标间隔”，去掉 60ms/DELAY 走停地板，只留 `MIN_POINT_INTERVAL_MS(12)` 下限；发送循环改用 `wait_after_send(t0,…)` 补偿式计时（串口+运动耗时计入间隔，只补睡到目标节拍），拐角停顿折进间隔不再单独叠加。抬落笔/Z 沉降等物理停顿保留。新增可调常量 `MIN_POINT_INTERVAL_MS`、`COLD_START_MIN_MS`（`robot_common.h`）。
+- 方案B（`motion.cpp` `resamplePolylineRDP` + `resample_range`）：书法落笔段改用 Ramer–Douglas–Peucker 按最大弦高偏差 `RESAMPLE_DEV_MM_CALLI(0.06mm)` 抽稀，直段塌成两端点（一笔到底）、弯曲与拐角自动保点；迭代实现防深递归。描边段沿用定步长 `RESAMPLE_STEP_MM_DRAW(1.2)` 不变。（曾用“转角自适应步长”方案，经曲线探针证伪——密集平滑曲线被误判为直线过度抽稀，已弃用改 RDP。）
+- 已验证（离线单测，`Robot.exe`/`RobotGUI.exe` `build.bat` 重编通过 RC=0）：完美直线 121→2 点、偏差 0；R=2~200mm 圆弧 RDP 后最大垂直偏差恒 ≤0.06mm 且半径越小保留越密（急弯 1.8 点/mm vs 近直 0.15 点/mm）；纯 XY 落笔点目标间隔 60→12ms、抬笔→落笔仍 202ms、100mm 定位仍按 ~1250ms。
+- 未验证（须上机）：真实控制器对相邻指令是“到点全停”还是“可在运动中接受新目标连续走/缓冲”——决定 A 能消除死等但能否根除每点顿挫的上限；9600 波特率单帧 ~22ms 是硬吞吐天花板；方案C（书法落笔改走 batch7 队列）是否更顺滑，需真机小样验证。上机前先空载、限位、手触急停。
+
 ## 待办
 - 决定是否把 `last_task.txt` / `gui_window.txt` / `robot_config.json` / `logs/` 改成按可执行文件目录解析（当前按 CWD，从别的目录启动会失效；见 bugs.md）。
 - 接入 `calib.json` 或设计带验证状态的 measured safe area，并统一作为运动硬拦截边界。
@@ -74,6 +93,10 @@ Win32 原生版“书画机械臂调试助手”已实现；UI 布局缺陷与�
 - 2026-09-18：新增 `使用说明.md`（构建/运行/GUI 各页/控制台菜单/配置与审计/上机安全/已知限制），README 加入指引；提交并推送分支 `feat/gui-win32-assistant`。
 - 2026-09-18：修复打开 GUI 后整体/文字闪烁——`OnPaint` 改内存位图双缓冲 + 一次 `BitBlt` 上屏，主窗口加 `WS_CLIPCHILDREN`（仅改 `gui_win32.cpp`）；`build.bat` 重编通过，`--dryrun` 启动 `Responding=True` 并优雅退出。
 - 2026-09-18：修复“连接设备”在 UI 线程打开串口导致蓝牙口卡死（与切页卡死同源）——`gs::connect` 改异步 `connect_async`，open 移到 detach 工作线程且期间不持 `g_mu`，结果经 `snapshot()["connect"]` 由 `WM_TIMER` 回报，`g_connect_pending` 防重复点击（改 `gui_service.{h,cpp}`+`gui_win32.cpp`）；`build.bat` 重编通过，`--dryrun` 启动 `Responding=True` 并优雅退出。蓝牙口真实阻塞路径未做自动化实测（跨进程驱动风险高），需上机手动验证。
+
+- 2026-09-18：书写中"停止任务"不跟手的 motion 侧加固——`transmitTrajectoryWithSplit` 原来只在外层段边界查 `g_estop`，一笔之内/描边整段批量循环不查→段中途停不下。新增 `estopLiftAt` 抬笔复位小函数，并在书法逐点 for、描边批量 while 每块、回退逐点 each 三处轮询 `g_estop`，命中即抬笔返回（`motion.cpp`）。注：急停与"停止任务"(`abort_task`)都置 `g_estop`，本改动让二者都能逐点打断；"停止按钮点了没反应 vs 急停有效"的 GUI 侧差异仍待上机确认（见 bugs.md）。整合编译 RC=0。
+- 2026-09-18：本机缺字库致"找不到书.json"——非回归（hanzi.cpp/HANZI_BASE_DIR 未改），派子代理下载 HanziWriter 常用字库到 `D:/objects/hanzi-writer-data/data/`。
+- 2026-09-18：节拍参数运行期可配置——新增全局 `g_z_settle_ms/g_stroke_begin_ms/g_stroke_end_ms/g_cold_start_min_ms/g_min_point_interval_ms`（默认取原 *_BASE 常量），`get_*`/`estimateMoveMs`/`wait_after_send` 改读全局，`gs::cfg_save/cfg_load` 增对应 5 键（`z_settle_ms` 等，0~3000ms 限幅），改 `robot_config.json` 重启即生效、无需重编（改 `robot_common.{h,cpp}`+`motion.cpp`+`gui_service.cpp`）。dryrun 归因（"书"，关描边）：prev 中位 186ms/最短 62ms(60ms 地板钉死)→ new(A/B) 153ms/31ms → LOW(压dwell) 109ms/26%<50ms；结论：顿挫大头是每笔 Z 沉降+起收笔 dwell+冷启动（省~20%），60ms 地板是次因（A 省~9%），RDP 对稀疏简单字不减点。LOW 版为测量极端值、勿上机（墨淡无锋）。
 
 ## 验证说明
 - 已验证：GUI 预检/开始书写/停止三条操作路径的审计事件落盘正确；控制台 DRYRUN 帧序列与拆分前基线逐帧一致；`build.bat` 一次产出两个 exe 并冒烟通过。

@@ -29,6 +29,13 @@ Windows / C++17 / Modbus RTU over RS485 / nlohmann::json。
 ## 关键约定
 优先复用现有 C++ 控制流程；不得把协议假设当成已上机验证事实；涉及硬件运动必须先空载、限位和急停验证。原 CR-3040/G-code 方案仅作为需求和流程参考，不直接继承其机械、电控或夹具设计。
 
+## 书写节拍与真机告警（2026-09-18 沉淀）
+- 节拍可运行期配置：`robot_config.json` 新增 5 键 `z_settle_ms / stroke_begin_ms / stroke_end_ms / cold_start_min_ms / min_point_interval_ms`（默认 120/70/90/150/12），由 `gs::cfg_load` 覆盖全局 `g_*`，改后重启即生效、无需重编；真机扫参就调这些。
+- dryrun 归因：顿挫大头是每笔 Z 沉降+起收笔 dwell+冷启动（压这些省 ~20%），60ms 走停地板是次因（方案A 省 ~9%）；RDP 只对密采样/长直笔画减点，简单稀疏字不减点。
+- 顿笔独立开关 `g_enableDunbi`（默认 true=保持现状，仿 `g_enableDip`）：持久化键 `enable_dunbi`、snapshot `cfg.enable_dunbi`、GUI 主页复选框（`IDC_CHECK_DUNBI`，idx5，画在蘸墨下方）、控制台菜单 21。关闭时：①`get_Z_SETTLE_MS/get_STROKE_BEGIN/END_DWELL_MS` 一律返回 0（含高质模式），首落笔"重压加固"块跳过（`isFirstDownThisCall` 增加 `&& g_enableDunbi`）→ 落笔过渡间隔从 ~202ms 降到 min_interval(12ms)；②`hanzi.cpp::zFor` 的点画 dot 由 `Z_DOWN_HEAVY` 改 `Z_DOWN_NORMAL`，与书写平面无关。**不动** medians 骨架几何、不删分层下刀(UP→MID→PRE→DOWN)、不删拐角 dwell。单元验证 verify_dunbi.exe 全 PASS。真机待验证：关闭后是否更顺滑、小字点画是否不再糊成墨点。
+- ⚠️ 速度编码疑似反向（待真机确认）：手册 `0x0008` 的 V 高字节 0~9 中 **00 最快**，但 `serial_port.cpp` 发 `level-1`（level 越大数值越大=越慢），与 `speedLevelToXYmmPerSec`（level 越大越快）相反；上机前先定"档→mm/s"真实方向再决定是否反转。
+- ⚠️ 描边/作画真机不安全：`auto_draw` 走 `0x0064` 批量，但手册明确 `0x0064` 是**固定抓放宏**（抓上/抓/抓上/放上/放/放上/等待），非任意轨迹；真机联调期保持 `auto_draw=false`，作画须先把描边改回逐点 `0x0008`。
+
 ## 审计日志约定（已实现）
 - GUI 操作写 `logs/audit_<yyyyMMdd_HHmmss>.jsonl`：首行 `event=session`，随后每操作一行，`fflush` 逐条落盘。
 - 字段：`source`（GUI/CONSOLE）、`actor`（HUMAN）、`mode`（DRYRUN/REAL/OFFLINE）、`operation`、`operation_id`、`request_id`、`session_id`、`parameters`、`result`、`error_code`；发送类事件另带 `tx_frame`/`rx_frame`/`device_response`/`ack_valid`/`retry_count`/`software_pose`。

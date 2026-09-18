@@ -59,6 +59,12 @@ extern float      Z_OFFSET; // 运行时整体偏移
 extern float g_z_top;       // ★设备最上可动 Z（实测 -320 可动、-310 不动）
 extern float g_z_bottom;    // ★设备最下可动 Z（下限保护，-385 已实测可动）
 
+// —— 书写平面（GUI“书写平面”页设置；随 robot_config.json 持久化）—— //
+// g_writing_plane_valid=false 时书写沿用原 Z_DOWN_HEAVY/NORMAL/LIGHT 三层深度；
+// 用户在页面点“保存”后置 true，此后所有落笔点的 Z = g_writing_plane_z（固定平面）。
+extern float g_writing_plane_z;       // 落笔接触深度（raw，不含 Z_OFFSET）
+extern bool  g_writing_plane_valid;   // 是否已由用户设定并持久化
+
 // 速度档（1~6）
 extern int SPEED_LEVEL;
 static const int SPEED_MIN = 1;
@@ -73,6 +79,22 @@ static const int   Z_SETTLE_MS_BASE = 120;
 static const int   STROKE_BEGIN_DWELL_MS_BASE = 70;
 static const int   STROKE_END_DWELL_MS_BASE = 90;
 static const float RESAMPLE_STEP_MM_BASE = 1.2f;
+
+// —— 方案A（节拍重整）：真机主要安全节拍旋钮 —— //
+// MIN_POINT_INTERVAL_MS：落笔逐点最小“指令间隔”。旧逻辑每点固定 sleep≥60ms（在串口往返之上
+//   再叠加死等），是书写顿挫的主因之一；现改为补偿式计时（串口+运动时间计入间隔），此值仅作
+//   纯 XY 直段点的下限保护。真机若出现拐角切角/失步，优先上调本值。
+// COLD_START_MIN_MS：每次下发调用开始的首秒内，指令间隔不小于此值（设备刚“醒”时更保守）。
+static const int   MIN_POINT_INTERVAL_MS = 12;
+static const int   COLD_START_MIN_MS = 150;
+
+// —— 运行期可调节拍（随 robot_config.json 持久化，改后重启生效；默认取上面的 *_BASE 常量）—— //
+// 真机扫参用：把每笔 Z 沉降 / 起收笔 dwell / 冷启动 / 逐点下限做成可配置，无需重编译。
+extern int g_z_settle_ms;            // 每笔 Z 沉降(ms)
+extern int g_stroke_begin_ms;        // 落笔起笔 dwell(ms)
+extern int g_stroke_end_ms;          // 收笔 dwell(ms)
+extern int g_cold_start_min_ms;      // 冷启动首秒指令间隔下限(ms)
+extern int g_min_point_interval_ms;  // 落笔逐点最小指令间隔(ms)
 
 // 探边
 static const float PROBE_STEP_DEFAULT = 5.0f;
@@ -172,6 +194,7 @@ extern WorkArea g_safeArea;
 extern DrawTheme g_theme;
 extern bool  g_autoDraw;
 extern bool  g_enableDip;            // 蘸墨总开关（默认关闭，先排除干扰）
+extern bool  g_enableDunbi;          // 顿笔总开关（默认开启=保持现状；关闭则去掉起收笔/沉降/首点重压停顿且点画等深，仅写骨架）
 extern bool  g_highQuality;          // 高质模式
 extern float g_center_x;             // ★中心点（菜单3复位目标；默认 0,0，菜单17可设）
 extern float g_center_y;

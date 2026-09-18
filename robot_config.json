@@ -1,20 +1,36 @@
 {
-  "auto_draw": true,
+  "auto_draw": false,
   "center": [
     0.0,
     0.0,
     -320.0
   ],
   "char_spacing": 1.0,
+  "cold_start_min_ms": 150,
   "enable_dip": false,
-  "high_quality": false,
+  "enable_dunbi": false,
+  "high_quality": true,
   "ink": [
     0.0,
     0.0,
     -350.0,
     false
   ],
+  "min_point_interval_ms": 12,
+  "paper": {
+    "cx": 0.0,
+    "cy": 0.0,
+    "dx": 0.0,
+    "dy": 0.0,
+    "h": 0.0,
+    "valid": false,
+    "w": 0.0
+  },
   "speed": 3,
+  "stroke_begin_ms": 70,
+  "stroke_end_ms": 90,
+  "writing_plane_valid": true,
+  "writing_plane_z": -348.0,
   "z_layers": [
     -325.0,
     -350.0,
@@ -27,5 +43,6 @@
     -320.0,
     -410.0
   ],
-  "z_offset": 0.0
+  "z_offset": 0.0,
+  "z_settle_ms": 120
 }

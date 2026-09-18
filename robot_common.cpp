@@ -27,6 +27,10 @@ float Z_DOWN_HEAVY = -388.0f;   // 重压（比书写深 3mm，真机验证后�
 float g_z_top = -320.0f;        // 设备最上可动 Z（实测）
 float g_z_bottom = -410.0f;     // 设备最下可动 Z（下限保护，-385 以下未实测）
 
+// —— 书写平面（默认未设定→书写沿用三层深度；GUI 保存后置 valid 并持久化）—— //
+float g_writing_plane_z = -385.0f;   // 落笔接触深度（raw，不含 Z_OFFSET）
+bool  g_writing_plane_valid = false;
+
 std::string HANZI_BASE_DIR = "D:/objects/hanzi-writer-data"; // HanziWriter 数据根
 std::string THEME_NAME = "jiangxue";                          // 主题
 
@@ -46,6 +50,7 @@ WorkArea g_safeArea{ SAFE_INIT_XMIN, SAFE_INIT_XMAX, SAFE_INIT_YMIN, SAFE_INIT_Y
 DrawTheme g_theme;             // 主题与运行时参数
 bool  g_autoDraw = true;
 bool  g_enableDip = false;     // 蘸墨总开关（默认关闭，先排除干扰）
+bool  g_enableDunbi = true;    // 顿笔总开关（默认开启=保持现状；关闭后书写仅走 medians 骨架，去掉压笔停顿与点画深压）
 bool  g_highQuality = true;
 
 float g_center_x = 0.f;        // ★中心点（菜单3复位目标）
@@ -53,6 +58,14 @@ float g_center_y = 0.f;
 float g_center_z = Z_UP;       // ★中心点复位高度（默认抬笔高度）
 std::string g_logPath;         // ★本次运行日志路径
 bool        g_logEnable = true;
+
+// —— 运行期可调节拍（默认值取常量；由 gs::cfg_load 从 robot_config.json 覆盖）—— //
+int g_z_settle_ms           = Z_SETTLE_MS_BASE;          // 120
+int g_stroke_begin_ms       = STROKE_BEGIN_DWELL_MS_BASE;// 70
+int g_stroke_end_ms         = STROKE_END_DWELL_MS_BASE;  // 90
+int g_cold_start_min_ms     = COLD_START_MIN_MS;         // 150
+int g_min_point_interval_ms = MIN_POINT_INTERVAL_MS;     // 12
+
 static FILE* g_logFile = nullptr;
 
 // ★设备 Z 行程校验（按实测范围，config 可调）

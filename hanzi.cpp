@@ -80,7 +80,7 @@ bool generateSingleCharTrajectory(const MMAHCharData& ch, int baseSpeed, std::ve
         return std::pair<float, float>{ (p.first - minx)* S, (p.second - miny)* S };
         };
     auto zFor = [&](const std::string& t)->float {
-        if (t == "dot")  return Z_DOWN_HEAVY;
+        if (t == "dot")  return g_enableDunbi ? Z_DOWN_HEAVY : Z_DOWN_NORMAL;  // 关闭顿笔：点画与普通笔画等深，避免小字墨点过大
         if (t == "heng") return Z_DOWN_NORMAL;
         if (t == "shu")  return Z_DOWN_NORMAL;
         return Z_DOWN_LIGHT;
@@ -89,18 +89,31 @@ bool generateSingleCharTrajectory(const MMAHCharData& ch, int baseSpeed, std::ve
     for (const auto& s : ch.strokes) {
         if (s.centerLine.empty()) continue;
         auto p0 = toLocal(s.centerLine.front());
-        float zdown = zFor(s.type);
-        traj.push_back(Point{ p0.first, p0.second, Z_UP,       false,(uint8_t)baseSpeed,"UP" });
-        traj.push_back(Point{ p0.first, p0.second, Z_MID,      false,(uint8_t)baseSpeed,"MID" });
-        traj.push_back(Point{ p0.first, p0.second, Z_PRE_DOWN, false,(uint8_t)baseSpeed,"PRE" });
-        traj.push_back(Point{ p0.first, p0.second, zdown,      true, (uint8_t)baseSpeed,s.type });
+        float zdown = g_writing_plane_valid ? g_writing_plane_z : zFor(s.type);
+        if (g_enableDunbi) {
+            // 现状：分层下刀 UP→MID→PRE→DOWN（真机上起笔逐层"往下戳"）
+            traj.push_back(Point{ p0.first, p0.second, Z_UP,       false,(uint8_t)baseSpeed,"UP" });
+            traj.push_back(Point{ p0.first, p0.second, Z_MID,      false,(uint8_t)baseSpeed,"MID" });
+            traj.push_back(Point{ p0.first, p0.second, Z_PRE_DOWN, false,(uint8_t)baseSpeed,"PRE" });
+            traj.push_back(Point{ p0.first, p0.second, zdown,      true, (uint8_t)baseSpeed,s.type });
+        } else {
+            // 关闭顿笔：单层直落，一笔一次冲到书写深度，消除起笔分层戳动
+            traj.push_back(Point{ p0.first, p0.second, Z_UP,  false,(uint8_t)baseSpeed,"UP" });
+            traj.push_back(Point{ p0.first, p0.second, zdown, true, (uint8_t)baseSpeed,s.type });
+        }
         for (size_t k = 1; k < s.centerLine.size(); ++k) {
             auto pk = toLocal(s.centerLine[k]);
             traj.push_back(Point{ pk.first, pk.second, zdown, true,(uint8_t)baseSpeed,s.type });
         }
         auto pe = toLocal(s.centerLine.back());
-        traj.push_back(Point{ pe.first, pe.second, Z_PRE_DOWN, false,(uint8_t)baseSpeed,"PRE" });
-        traj.push_back(Point{ pe.first, pe.second, Z_MID,      false,(uint8_t)baseSpeed,"MID" });
+        if (g_enableDunbi) {
+            // 现状：分层收笔 DOWN→PRE→MID
+            traj.push_back(Point{ pe.first, pe.second, Z_PRE_DOWN, false,(uint8_t)baseSpeed,"PRE" });
+            traj.push_back(Point{ pe.first, pe.second, Z_MID,      false,(uint8_t)baseSpeed,"MID" });
+        } else {
+            // 关闭顿笔：单层直抬，一笔一次抬到 Z_UP，消除收笔分层戳动
+            traj.push_back(Point{ pe.first, pe.second, Z_UP, false,(uint8_t)baseSpeed,"UP" });
+        }
     }
     // 末尾抬笔，方便分字
     if (!traj.empty()) {

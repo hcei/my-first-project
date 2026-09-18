@@ -24,6 +24,10 @@ public:
     static void packPoint5(const Point& p, int16_t(&out5)[5]);
     bool sendPointsBatch7(const std::vector<Point>& pts7, int max_retries = 3);
 
+    // —— 0x03 读坐标（供实时轨迹调试；手册 6.1：读 0x0008×5）—— //
+    // 仅在任务线程、串口空闲时调用（半双工单总线，不得与发送并发）。DRYRUN / 未打开返回 false。
+    bool readPose(float& x, float& y, float& z);
+
 private:
     HANDLE h_;
 };

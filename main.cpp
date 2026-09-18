@@ -301,6 +301,7 @@ static void print_menu() {
     wprintln(L"18. 开关：日志记录（logs/Robot_时间.log，含全部输出与时间戳）");
     wprintln(L"19. Z 层校准（输入抬笔Z 书写Z，自动推算中位/预压/轻触/重压）");
     wprintln(L"20. 设置设备 Z 行程范围（上限/下限，自定义可动边界）");
+    wprintln(L"21. 开关：顿笔（起笔/收笔按压停顿 + 点画深压；关闭后仅写每字 medians 骨架）");
     std::wstringstream ws;
     ws << L"[状态] DRYRUN=" << (g_dryRun ? L"ON" : L"OFF")
         << L" 速度=" << SPEED_LEVEL
@@ -309,12 +310,13 @@ static void print_menu() {
         << L" 自动描边=" << (g_autoDraw ? L"ON" : L"OFF")
         << L" 高质=" << (g_highQuality ? L"ON" : L"OFF")
         << L" 蘸墨=" << (g_enableDip ? L"ON" : L"OFF")
+        << L" 顿笔=" << (g_enableDunbi ? L"ON" : L"OFF")
         << L" 中心点=(" << g_center_x << L"," << g_center_y << L"," << g_center_z << L")"
         << L" 抬笔=" << Z_UP << L" 书写=" << Z_DOWN_NORMAL
         << L" 日志=" << (g_logEnable ? L"ON" : L"OFF")
         << L" SAFE:[" << g_safeArea.xmin << L"," << g_safeArea.xmax << L"; " << g_safeArea.ymin << L"," << g_safeArea.ymax << L"]";
     wprintln(ws.str());
-    wprintln(L"选择(0-20) / Select：");
+    wprintln(L"选择(0-21) / Select：");
 }
 
 // --------------------------- 急停线程 ---------------------------
@@ -689,6 +691,12 @@ int main(int argc, char** argv) {
         }
         else if (sel == 20) {
             menu_set_z_limits();
+        }
+        else if (sel == 21) {
+            g_enableDunbi = !g_enableDunbi;
+            std::wstringstream ws;
+            ws << L"[信息] 顿笔已" << (g_enableDunbi ? L"开启（起收笔按压·点画深压）" : L"关闭（仅写每字 medians 骨架）");
+            wprintln(ws.str());
         }
         else {
             wprintln(L"[提示] 无此选项。");

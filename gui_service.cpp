@@ -7,6 +7,7 @@
 //   - 任务线程统一为 detach 线程 + 原子标志；运动路径复用 motion.cpp 原函数，
 //     task::progress 钩子在 motion.cpp 内更新，GUI 侧只读快照。
 #include "gui_service.h"
+#include "gui_trail.h"
 
 #include <atomic>
 #include <chrono>
@@ -207,6 +208,7 @@ void log_send_point(const Point& p, const uint8_t* tx, size_t txlen,
     ev["software_pose"] = { g_last_pose.x, g_last_pose.y, g_last_pose.z, g_last_pose.isPenDown };
     if (g_pose_init) ev["pose_ts"] = g_pose_ts;
     audit_locked(ev);
+    if (g_task_active) trail::addCommanded(p);   // ★实时轨迹：仅任务运行期记录已下发点（软件位姿）
 }
 
 void log_send_batch7(const std::vector<Point>& pts, size_t n,
@@ -239,6 +241,7 @@ void log_send_batch7(const std::vector<Point>& pts, size_t n,
     ev["software_pose"] = { g_last_pose.x, g_last_pose.y, g_last_pose.z, g_last_pose.isPenDown };
     if (g_pose_init) ev["pose_ts"] = g_pose_ts;
     audit_locked(ev);
+    if (g_task_active) trail::addCommandedBatch(pts, n);   // ★实时轨迹：描边/批量点同样记录
 }
 
 void note_pose_updated() {
@@ -361,11 +364,12 @@ json snapshot() {
         { "speed", SPEED_LEVEL }, { "char_spacing", CHAR_SPACING },
         { "z_offset", Z_OFFSET },
         { "auto_draw", g_autoDraw }, { "high_quality", g_highQuality },
-        { "enable_dip", g_enableDip }, { "log", g_logEnable },
+        { "enable_dip", g_enableDip }, { "enable_dunbi", g_enableDunbi }, { "log", g_logEnable },
         { "char_size", ACTIVE_CHAR_SIZE }, { "plan_cols", g_plan_cols },
         { "pose_source", "软件位姿（最后有效 ACK）" },
         { "safe_area", { g_safeArea.xmin, g_safeArea.xmax, g_safeArea.ymin, g_safeArea.ymax } },
-        { "z_up", Z_UP }, { "z_normal", Z_DOWN_NORMAL } };
+        { "z_up", Z_UP }, { "z_normal", Z_DOWN_NORMAL },
+        { "writing_plane_z", g_writing_plane_z }, { "writing_plane_valid", g_writing_plane_valid } };
     j["memory"] = "未接入";
     j["storage"] = "未接入";
     j["battery"] = "未接入";
@@ -519,6 +523,46 @@ bool heartbeat(std::string& err) {
     return ok;
 }
 
+// —— 书写平面：把机械臂移到 (0,0,z) 悬停，供目视确认笔尖实际接触高度（不书写）—— //
+bool preview_writing_plane(float z, std::string& err) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    if (g_task_active) { err = "任务运行中，请先停止任务"; return false; }
+    if (!g_dryRun && !g_port.is_open()) { err = "串口未连接"; return false; }
+    if (!std::isfinite(z)) { err = "Z 无效"; return false; }
+    if (!inXYRange(0.f, 0.f, g_devLimit) || !inZRange(z + Z_OFFSET)) {
+        std::ostringstream os; os << "Z 越界（有效 " << g_z_bottom << "~" << g_z_top
+            << "，含偏移后 Z=" << (z + Z_OFFSET) << "）";
+        err = os.str(); return false;
+    }
+    session_id();
+    bool ok = g_port.sendPointRetry(Point{ 0.f, 0.f, z, false, (uint8_t)SPEED_LEVEL, "PLANE-PROBE" });
+    err = ok ? "" : "悬停点发送失败";
+    return ok;
+}
+
+// —— 书写平面：保存即生效并持久化；后续书写所有落笔点用该固定 Z —— //
+bool set_writing_plane(float z, std::string& err) {
+    if (g_task_active) { err = "任务运行中，请先停止任务"; return false; }
+    if (!std::isfinite(z)) { err = "Z 无效"; return false; }
+    if (!inZRange(z + Z_OFFSET)) {
+        std::ostringstream os; os << "Z 越界（有效 " << g_z_bottom << "~" << g_z_top
+            << "，含偏移后 Z=" << (z + Z_OFFSET) << "）";
+        err = os.str(); return false;
+    }
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        session_id();
+        g_writing_plane_z = z;
+        g_writing_plane_valid = true;
+        json ev = op_event("set_writing_plane", nullptr);
+        ev["parameters"] = { { "z", z } };
+        ev["result"] = "ok";
+        audit_locked(ev);
+    }
+    cfg_save();
+    return true;
+}
+
 void request_estop() {
     g_estop = true;
     std::lock_guard<std::recursive_mutex> lk(g_mu);
@@ -663,6 +707,13 @@ static void run_task_thread(std::string text) {
             return;
         }
         task::char_done((int)ci);
+
+        // ★实时轨迹：真机每字采一次 0x03 实测坐标（任务线程独占串口，readPose 安全穿插）
+        if (!g_dryRun && g_port.is_open()) {
+            float ax = 0, ay = 0, az = 0;
+            if (g_port.readPose(ax, ay, az)) trail::addActual(ax, ay);
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(g_highQuality ? 160 : 120));
 
         if (g_enableDip && ((int)(ci + 1) % 5 == 0) && ci + 1 < chars.size()) {
@@ -718,6 +769,7 @@ bool start_write(const std::string& utf8_text, std::string& err) {
         ev["parameters"] = { { "text", utf8_text } };
         audit_locked(ev);
         g_task_active = true;
+        trail::reset();                 // ★新任务开始：清空上一任务的实时轨迹
         g_task_thread = std::thread([text = utf8_text]() {
             run_task_thread(text);
             g_task_active = false;
@@ -753,6 +805,7 @@ bool set_z_offset(float v) {
 void toggle_auto_draw()    { if (!g_task_active) { g_autoDraw = !g_autoDraw; cfg_save(); } }
 void toggle_high_quality() { if (!g_task_active) { g_highQuality = !g_highQuality; cfg_save(); } }
 void toggle_enable_dip()   { if (!g_task_active) { g_enableDip = !g_enableDip; cfg_save(); } }
+void toggle_enable_dunbi() { if (!g_task_active) { g_enableDunbi = !g_enableDunbi; cfg_save(); } }
 bool set_dry_run(bool on) {
     if (g_task_active) return false;
     g_dryRun = on; return true;
@@ -769,9 +822,18 @@ bool cfg_save() {
     j["auto_draw"]    = g_autoDraw;
     j["high_quality"] = g_highQuality;
     j["enable_dip"]   = g_enableDip;
+    j["enable_dunbi"] = g_enableDunbi;
     j["ink"]          = { g_ink.x, g_ink.y, g_ink.z, g_ink.valid };
     j["z_layers"]     = { Z_UP, Z_MID, Z_PRE_DOWN, Z_DOWN_LIGHT, Z_DOWN_NORMAL, Z_DOWN_HEAVY };
     j["z_limits"]     = { g_z_top, g_z_bottom };
+    j["z_settle_ms"]           = g_z_settle_ms;
+    j["stroke_begin_ms"]       = g_stroke_begin_ms;
+    j["stroke_end_ms"]         = g_stroke_end_ms;
+    j["cold_start_min_ms"]     = g_cold_start_min_ms;
+    j["min_point_interval_ms"] = g_min_point_interval_ms;
+    j["writing_plane_z"]       = g_writing_plane_z;
+    j["writing_plane_valid"]   = g_writing_plane_valid;
+    j["paper"]        = trail::paperToJson();   // ★实时轨迹：纸张边界持久化（下次开 GUI 沿用）
     std::ofstream ofs("robot_config.json");
     if (!ofs) { wprintln(L"[警告] 配置保存失败：robot_config.json 无法写入。"); return false; }
     ofs << j.dump(2);
@@ -804,6 +866,26 @@ void cfg_load() {
         if (j.contains("auto_draw"))    g_autoDraw    = j["auto_draw"].get<bool>();
         if (j.contains("high_quality")) g_highQuality = j["high_quality"].get<bool>();
         if (j.contains("enable_dip"))   g_enableDip   = j["enable_dip"].get<bool>();
+        if (j.contains("enable_dunbi")) g_enableDunbi = j["enable_dunbi"].get<bool>();
+        {
+            auto clampi = [](long long v, long long lo, long long hi){ return v < lo ? (int)lo : (v > hi ? (int)hi : (int)v); };
+            auto geti = [&](const char* k, int cur)->int{
+                if (!j.contains(k) || !j[k].is_number()) return cur;
+                return clampi(j[k].get<long long>(), 0, 3000);
+                };
+            g_z_settle_ms           = geti("z_settle_ms",           g_z_settle_ms);
+            g_stroke_begin_ms       = geti("stroke_begin_ms",       g_stroke_begin_ms);
+            g_stroke_end_ms         = geti("stroke_end_ms",         g_stroke_end_ms);
+            g_cold_start_min_ms     = geti("cold_start_min_ms",     g_cold_start_min_ms);
+            g_min_point_interval_ms = geti("min_point_interval_ms", g_min_point_interval_ms);
+        }
+        if (j.contains("writing_plane_z") && j["writing_plane_z"].is_number()) {
+            float z = j["writing_plane_z"].get<float>();
+            if (std::isfinite(z) && inZRange(z)) {
+                g_writing_plane_z = z;
+                g_writing_plane_valid = j.value("writing_plane_valid", false);
+            }
+        }
         if (j.contains("ink") && j["ink"].is_array() && j["ink"].size() == 4) {
             g_ink = InkStation{ j["ink"][0].get<float>(), j["ink"][1].get<float>(),
                                 j["ink"][2].get<float>(), j["ink"][3].get<bool>() };
@@ -828,6 +910,7 @@ void cfg_load() {
                 g_center_x = x; g_center_y = y; g_center_z = z;
             }
         }
+        if (j.contains("paper")) trail::paperFromJson(j["paper"]);   // ★实时轨迹：沿用上次纸张边界
         wprintln(L"[信息] 已加载配置 robot_config.json。");
     }
     catch (...) { wprintln(L"[警告] 配置文件解析失败，使用默认设置。"); }
