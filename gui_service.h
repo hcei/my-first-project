@@ -90,8 +90,20 @@ json task_info();
 bool set_speed(int v);
 bool set_char_spacing(float v);
 bool set_z_offset(float v);
+// —— 手动排版（GUI 书写页实时调整；改动即存，任务运行中拒绝）—— //
+bool set_layout_mode(int mode);            // 0=自动, 1=手动
+bool set_layout_char_size(float mm);       // 字号 mm（≥60）
+bool set_layout_cols(int cols);            // 每行字数
+bool set_layout_top_ratio(float ratio);    // 上区占比 0.10~0.95
+bool set_layout_row_spacing(float mm);     // 行间距 mm
+bool set_write_dir(int dir);               // 书写方向 0=横排左起, 1=竖排右起
+json layout_preview(const std::string& utf8_text);  // 实时预检明细 + 叠画计划字块（世界坐标）
 bool preview_writing_plane(float z, std::string& err);  // 移到 (0,0,z) 悬停，确认书写高度（不书写）
 bool set_writing_plane(float z, std::string& err);      // 保存书写平面 Z：生效 + 持久化（后续书写统一用该 Z）
+// —— 四角标定（实时轨迹面板）：预览=抬笔移到该角(真机移动)；保存=固定并持久化；清除=复位 —— //
+bool preview_corner(float x, float y, std::string& err);
+bool save_corner(int i, float x, float y, std::string& err);
+void clear_corners();
 void toggle_auto_draw();
 void toggle_high_quality();
 void toggle_enable_dip();

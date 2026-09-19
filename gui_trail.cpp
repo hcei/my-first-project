@@ -17,7 +17,7 @@ std::vector<Cpt> g_cmd;
 std::vector<Apt> g_act;
 uint64_t   g_epoch = 0;
 bool       g_trunc = false;
-PaperBox   g_paper;
+Corner     g_corners[kCorners];
 
 inline bool finite2(float x, float y) { return std::isfinite(x) && std::isfinite(y); }
 
@@ -33,7 +33,7 @@ void addCommanded(const Point& p) {
     if (!finite2(p.x, p.y)) return;
     std::lock_guard<std::mutex> lk(g_tmux);
     if (g_cmd.size() >= MAX_CMD) { g_trunc = true; return; }
-    g_cmd.push_back(Cpt{ p.x, p.y, p.isPenDown ? 1 : 0 });
+    g_cmd.push_back(Cpt{ p.x, p.y, (uint8_t)(p.isPenDown ? 1 : 0) });
 }
 
 void addCommandedBatch(const std::vector<Point>& pts, size_t n) {
@@ -42,7 +42,7 @@ void addCommandedBatch(const std::vector<Point>& pts, size_t n) {
     for (size_t i = 0; i < k; ++i) {
         if (!finite2(pts[i].x, pts[i].y)) continue;
         if (g_cmd.size() >= MAX_CMD) { g_trunc = true; return; }
-        g_cmd.push_back(Cpt{ pts[i].x, pts[i].y, pts[i].isPenDown ? 1 : 0 });
+        g_cmd.push_back(Cpt{ pts[i].x, pts[i].y, (uint8_t)(pts[i].isPenDown ? 1 : 0) });
     }
 }
 
@@ -85,33 +85,77 @@ void bounds(float& minx, float& miny, float& maxx, float& maxy) {
     }
 }
 
-PaperBox paper() { std::lock_guard<std::mutex> lk(g_tmux); return g_paper; }
-void setPaper(const PaperBox& pb) { std::lock_guard<std::mutex> lk(g_tmux); g_paper = pb; }
-
-nlohmann::json paperToJson() {
+void setCorner(int i, float x, float y) {
+    if (i < 0 || i >= kCorners) return;
+    if (!finite2(x, y)) return;
     std::lock_guard<std::mutex> lk(g_tmux);
-    return nlohmann::json{
-        { "cx", g_paper.cx }, { "cy", g_paper.cy },
-        { "w",  g_paper.w },  { "h",  g_paper.h },
-        { "dx", g_paper.dx }, { "dy", g_paper.dy },
-        { "valid", g_paper.valid } };
+    g_corners[i].x = x; g_corners[i].y = y; g_corners[i].valid = true;
+}
+void clearCorner(int i) {
+    if (i < 0 || i >= kCorners) return;
+    std::lock_guard<std::mutex> lk(g_tmux);
+    g_corners[i] = Corner{};
+}
+void clearCorners() {
+    std::lock_guard<std::mutex> lk(g_tmux);
+    for (int i = 0; i < kCorners; ++i) g_corners[i] = Corner{};
+}
+Corner corner(int i) {
+    if (i < 0 || i >= kCorners) return Corner{};
+    std::lock_guard<std::mutex> lk(g_tmux);
+    return g_corners[i];
+}
+int cornerCount() {
+    std::lock_guard<std::mutex> lk(g_tmux);
+    int c = 0;
+    for (int i = 0; i < kCorners; ++i) if (g_corners[i].valid) ++c;
+    return c;
+}
+bool cornersBounds(float& minx, float& miny, float& maxx, float& maxy) {
+    std::lock_guard<std::mutex> lk(g_tmux);
+    bool any = false;
+    for (int i = 0; i < kCorners; ++i) {
+        if (!g_corners[i].valid) continue;
+        float x = g_corners[i].x, y = g_corners[i].y;
+        if (!any) { minx = maxx = x; miny = maxy = y; any = true; }
+        else {
+            minx = std::min(minx, x); maxx = std::max(maxx, x);
+            miny = std::min(miny, y); maxy = std::max(maxy, y);
+        }
+    }
+    return any;
+}
+void getCorners(Corner out[kCorners]) {
+    std::lock_guard<std::mutex> lk(g_tmux);
+    for (int i = 0; i < kCorners; ++i) out[i] = g_corners[i];
 }
 
-void paperFromJson(const nlohmann::json& j) {
-    PaperBox pb;
-    try {
-        if (j.contains("cx"))    pb.cx    = j["cx"].get<float>();
-        if (j.contains("cy"))    pb.cy    = j["cy"].get<float>();
-        if (j.contains("w"))     pb.w     = j["w"].get<float>();
-        if (j.contains("h"))     pb.h     = j["h"].get<float>();
-        if (j.contains("dx"))    pb.dx    = j["dx"].get<float>();
-        if (j.contains("dy"))    pb.dy    = j["dy"].get<float>();
-        if (j.contains("valid")) pb.valid = j["valid"].get<bool>();
-    } catch (...) { return; }
-    if (pb.valid && (!std::isfinite(pb.w) || !std::isfinite(pb.h) || pb.w <= 0.f || pb.h <= 0.f))
-        pb.valid = false;
+nlohmann::json calibToJson() {
     std::lock_guard<std::mutex> lk(g_tmux);
-    g_paper = pb;
+    nlohmann::json arr = nlohmann::json::array();
+    for (int i = 0; i < kCorners; ++i)
+        arr.push_back(nlohmann::json{ { "x", g_corners[i].x }, { "y", g_corners[i].y },
+                                      { "valid", g_corners[i].valid } });
+    return arr;
+}
+
+void calibFromJson(const nlohmann::json& j) {
+    if (!j.is_array()) return;
+    Corner tmp[kCorners];
+    for (size_t i = 0; i < j.size() && i < (size_t)kCorners; ++i) {
+        const nlohmann::json& e = j[i];
+        if (!e.is_object()) continue;
+        Corner c;
+        try {
+            if (e.contains("x")) c.x = e["x"].get<float>();
+            if (e.contains("y")) c.y = e["y"].get<float>();
+            if (e.contains("valid")) c.valid = e["valid"].get<bool>();
+        } catch (...) { c = Corner{}; }
+        if (c.valid && (!std::isfinite(c.x) || !std::isfinite(c.y))) c = Corner{};
+        tmp[i] = c;
+    }
+    std::lock_guard<std::mutex> lk(g_tmux);
+    for (int i = 0; i < kCorners; ++i) g_corners[i] = tmp[i];
 }
 
 }} // namespace gs::trail

@@ -16,16 +16,10 @@ namespace gs { namespace trail {
 struct Cpt { float x{ 0 }, y{ 0 }; uint8_t pen{ 0 }; };   // 已下发轨迹点；pen=1 落笔、0 抬笔移动
 struct Apt { float x{ 0 }, y{ 0 }; };                      // 真机 0x03 实测采样点（mm）
 
-struct PaperBox {
-    float cx{ 0 }, cy{ 0 };   // 纸张中心（默认 = 底盘中心点，mm）
-    float w{ 0 },  h{ 0 };    // 纸张宽 × 高（mm）
-    float dx{ 0 }, dy{ 0 };   // 微调偏移（mm）
-    bool  valid{ false };     // 是否已设定（false 时绘图按数据外接框自动缩放）
-    float xmin() const { return cx + dx - w / 2.0f; }
-    float xmax() const { return cx + dx + w / 2.0f; }
-    float ymin() const { return cy + dy - h / 2.0f; }
-    float ymax() const { return cy + dy + h / 2.0f; }
-};
+// 四角标定：用户依次输入纸面四角的设备坐标（mm，与轨迹点同一坐标系、Y+ 同向）。
+// 每角可先“预览”（机械臂抬笔移到该点）再“保存”（固定下来，随配置持久化）。
+struct Corner { float x{ 0 }, y{ 0 }; bool valid{ false }; };
+enum { kCorners = 4 };
 
 // —— 任务生命周期 ——
 void reset();                 // 清空轨迹并 epoch++（UI 据此把游标重置为全量）
@@ -45,10 +39,15 @@ size_t   commandedSize();
 size_t   actualSize();
 void     bounds(float& minx, float& miny, float& maxx, float& maxy);   // 下发点外接框；无数据回退设备极限
 
-// —— 纸张边界（持久化经 gs::cfg_save/cfg_load 的 "paper" 子对象）——
-PaperBox paper();
-void     setPaper(const PaperBox& pb);              // 仅更新内存与 valid；持久化由调用方另调 gs::cfg_save()
-nlohmann::json paperToJson();                        // 供 cfg_save
-void           paperFromJson(const nlohmann::json& j);   // 供 cfg_load
+// —— 四角标定（持久化经 gs::cfg_save/cfg_load 的 "corners" 数组）——
+void   setCorner(int i, float x, float y);        // 置第 i 个角为有效（越界索引/非有限值忽略）
+void   clearCorner(int i);
+void   clearCorners();
+Corner corner(int i);                              // i 0..3；越界返回 invalid
+int    cornerCount();                             // 已保存（有效）角数
+bool   cornersBounds(float& minx, float& miny, float& maxx, float& maxy);  // 有效角外接框；有则 true
+void   getCorners(Corner out[kCorners]);          // 供绘制读取
+nlohmann::json calibToJson();                      // 供 cfg_save（写 "corners"）
+void           calibFromJson(const nlohmann::json& j);   // 供 cfg_load
 
 }} // namespace gs::trail

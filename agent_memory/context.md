@@ -36,6 +36,21 @@ Windows / C++17 / Modbus RTU over RS485 / nlohmann::json。
 - ⚠️ 速度编码疑似反向（待真机确认）：手册 `0x0008` 的 V 高字节 0~9 中 **00 最快**，但 `serial_port.cpp` 发 `level-1`（level 越大数值越大=越慢），与 `speedLevelToXYmmPerSec`（level 越大越快）相反；上机前先定"档→mm/s"真实方向再决定是否反转。
 - ⚠️ 描边/作画真机不安全：`auto_draw` 走 `0x0064` 批量，但手册明确 `0x0064` 是**固定抓放宏**（抓上/抓/抓上/放上/放/放上/等待），非任意轨迹；真机联调期保持 `auto_draw=false`，作画须先把描边改回逐点 `0x0008`。
 
+## GUI 排版（字号/布局/方向）约定（2026-09-19 实现，勿重复）
+- 排版 = **自动/手动双模式 + 书写方向**，入口在「书写任务」页左栏（不新开页）。默认自动＝沿用 `plan_text_area_and_layout` 旧搜索，行为零回归。
+- 全局（`robot_common.{h,cpp}`，均随 `robot_config.json` 持久化、`gs::cfg_load` 覆盖）：`g_layout_mode`(0/1)、`g_lm_char_size`(≥60 上不封顶)、`g_lm_cols`(每线字数)、`g_lm_top_ratio`(0.10~0.95)、`g_lm_row_spacing`(行距,独立于 CHAR_SPACING)、`g_write_dir`(0横排左起/1竖排右起·列内上到下·列从右往左)。`TextPlan` 加 `err`(LayoutErr 码)/`row_spacing`/`dir`。
+- hanzi：抽出方向感知共享函数 `grid_extents(n,per,S,along,cross,dir→gw/gh/nLines)` 与 `fill_offsets(...)`；`plan_manual_layout(...,dir)` 与 `plan_text_area_and_layout(...,dir)` 都走它们，`prepare_layout_only` 按 `g_layout_mode` 分流、传 `g_write_dir`。**关键约束**：fit 基准是 `g_safeArea`（设备安全区），不是 paper 盒（`paper.valid=false` 也能判）；字号下限 60 比赛红线；手动放不下**报 `err` 不自动缩放**；竖排右起是**宽高轴向交换**；自动模式竖排候选改 `{4,3,2,5}` 偏好短列（横排仍 `{5,4}`）。
+- 服务层（`gui_service.{h,cpp}`）：`set_layout_mode/char_size/cols/top_ratio/row_spacing`、`set_write_dir`（均 `g_task_active` 拒绝+`cfg_save`）；`layout_preview(text)` 返回不写审计的实时预检明细 + `cells`（计划字块世界坐标 x/y/s/ch）供叠画；`preflight` 补 `mode/dir/row_spacing/err_code`；snapshot.cfg 暴露上述键。
+- GUI（`gui_win32.cpp`）：书写页 `WLGeo` 共享几何放 4 输入框 + `g_chkManual`(手动) + `g_chkVert`(竖排) + 应用/恢复自动；`EN_CHANGE`→`ApplyLayoutFields`+`RefreshLayoutPreview`（`g_laySuppress` 防回环）；计划字块叠画进 `DrawTrailPanel`，**显示条件 `g_prevValid && !task_active && gs::trail::commandedSize()==0`**（一旦任务跑过有轨迹就不再叠画，避免与真实轨迹重叠）；`IDC_BTN_WRITE` 用 `g_prevValid` 做可行性闸门。
+
+## 实时轨迹与四角标定约定（2026-09-19 实现）
+- 模块 `gui_trail.{h,cpp}`（`gs::trail`）：存已下发轨迹 `Cpt{x,y,pen}`、实测点 `Apt{x,y}`、四角 `Corner[4]`；自带独立 `std::mutex`，**锁序恒 `g_mu → trail`**，内部绝不回调 `gs::`（避免反向死锁）。GUI 用 `epoch()` 判任务 reset、游标增量 `fetchCommanded/fetchActual` 取数。
+- 轨迹**仅在 `g_task_active` 时记录**（挂在 `device::log_send_point`/`log_send_batch7` 钩子），回中心/心跳/测试点等快捷操作不进图。
+- 实测点：`SerialPort::readPose(x,y,z)` 走 Modbus **0x03 读 0x0008×5**（回帧 15 字节，坐标 0.1mm 编码 ÷10）；**只能在任务线程调用**（半双工单总线 + 反馈延迟 ≤300ms，且 `SerialPort` 由单写者占用），现每字采一次。**读回是实际位置还是最后写值待上机确认**。
+- 四角标定：用户依次输入四角**设备 mm 坐标**（与轨迹点同系），每角「预览」/「保存」；持久化到 `robot_config.json` 的 `"corners"`（数组 {x,y,valid}），下次开 GUI 沿用，「清除标定」复位。绘图视口优先按已下发轨迹、无轨迹有角→按角框、都无→`g_devLimit`；四角齐全时**按绕质心极角排序连线**成简单四边形（防输入顺序导致交叉）。
+- `gs::preview_corner(x,y)`：抬笔移到该角，**真机会物理移动**（属硬件动作）——任务中拒绝、未连接拒绝、`inXYRange`+`inZRange` 越界拦截、DRYRUN 仅打帧；Z 用**已固定书写平面** `g_writing_plane_z`（valid 时）否则 `Z_UP`。`save_corner` 校验后写角+审计 `corner_save`+`cfg_save`。
+- **可达边界（已撤销实验，回原版）**：曾把 `g_devLimit` 做成 config `"dev_limit"` 可配置并全局收紧到 X±162/Y±85，后经真机验证**已撤销回原版**——`g_devLimit` 恢复固定 ±180（无 config 键、无 snapshot 项），`sendPoint`/`preview_corner`/`save_corner` 按 ±180 校验。**探明的硬事实（保留）**：真机上电可达极限就是 **X±162 / Y±85**，且断电可手推越过 → 限制在**控制器/机构侧，非软件**（疑控制器工作区软限位，手册 ±180 但固件设小），软件无法扩，需找厂商放参数或改机械；超出该框的点控制器会静默夹到边界。**四角预览/保存/清除结果在轨迹面板标题行显示**（`SetResult` 顶部横幅只画在主页）——此 UI 保留。
+
 ## 审计日志约定（已实现）
 - GUI 操作写 `logs/audit_<yyyyMMdd_HHmmss>.jsonl`：首行 `event=session`，随后每操作一行，`fflush` 逐条落盘。
 - 字段：`source`（GUI/CONSOLE）、`actor`（HUMAN）、`mode`（DRYRUN/REAL/OFFLINE）、`operation`、`operation_id`、`request_id`、`session_id`、`parameters`、`result`、`error_code`；发送类事件另带 `tx_frame`/`rx_frame`/`device_response`/`ack_valid`/`retry_count`/`software_pose`。

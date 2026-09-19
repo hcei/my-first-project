@@ -7,6 +7,28 @@
   ],
   "char_spacing": 1.0,
   "cold_start_min_ms": 150,
+  "corners": [
+    {
+      "valid": true,
+      "x": 160.0,
+      "y": -80.0
+    },
+    {
+      "valid": true,
+      "x": 160.0,
+      "y": 80.0
+    },
+    {
+      "valid": true,
+      "x": -160.0,
+      "y": -80.0
+    },
+    {
+      "valid": true,
+      "x": -160.0,
+      "y": 80.0
+    }
+  ],
   "enable_dip": false,
   "enable_dunbi": false,
   "high_quality": true,
@@ -16,21 +38,18 @@
     -350.0,
     false
   ],
+  "layout_char_size": 60.0,
+  "layout_cols": 4,
+  "layout_mode": 0,
+  "layout_row_spacing": 8.0,
+  "layout_top_ratio": 0.8500000238418579,
   "min_point_interval_ms": 12,
-  "paper": {
-    "cx": 0.0,
-    "cy": 0.0,
-    "dx": 0.0,
-    "dy": 0.0,
-    "h": 0.0,
-    "valid": false,
-    "w": 0.0
-  },
   "speed": 3,
   "stroke_begin_ms": 70,
   "stroke_end_ms": 90,
+  "write_dir": 1,
   "writing_plane_valid": true,
-  "writing_plane_z": -348.0,
+  "writing_plane_z": -365.0,
   "z_layers": [
     -325.0,
     -350.0,

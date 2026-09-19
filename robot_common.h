@@ -65,6 +65,19 @@ extern float g_z_bottom;    // ★设备最下可动 Z（下限保护，-385 已
 extern float g_writing_plane_z;       // 落笔接触深度（raw，不含 Z_OFFSET）
 extern bool  g_writing_plane_valid;   // 是否已由用户设定并持久化
 
+// —— 手动排版（GUI「书写任务」页排版控件设置；随 robot_config.json 持久化）—— //
+// g_layout_mode=0 自动：沿用 plan_text_area_and_layout 的自动搜索（默认，行为不变）；
+// g_layout_mode=1 手动：按下面四项严格排布（字号上不封顶，仅受安全区文本框 fit 约束），
+// 放不下时 prepare_layout_only 直接置 ok=false 并回 err 原因码，绝不自动缩小。
+extern int   g_layout_mode;        // 0=自动, 1=手动
+extern float g_lm_char_size;       // 字号 mm（≥60 比赛红线，上不封顶）
+extern int   g_lm_cols;            // 每行字数
+extern float g_lm_top_ratio;       // 上区占比（文本区占安全区高度比例 0.10~0.95）
+extern float g_lm_row_spacing;     // 行间距 mm（独立于列内 CHAR_SPACING）
+// 书写方向：0=横排左起（默认，现状）；1=竖排右起（列内从上到下、列与列从右往左，传统书法）。
+// 独立于自动/手动模式，决定 TextPlan.offsets 的字序映射。随 robot_config.json 持久化。
+extern int   g_write_dir;
+
 // 速度档（1~6）
 extern int SPEED_LEVEL;
 static const int SPEED_MIN = 1;
@@ -163,13 +176,26 @@ struct DrawTheme {
     float vgap_mm{ V_GAP_BETWEEN };
 };
 
+// 排版失败原因码（仅手动模式产生；0=成功）
+enum LayoutErr {
+    LAY_OK = 0,
+    LAY_NO_CHARS = 1,     // 无有效汉字
+    LAY_FONT_W = 2,       // 单字宽度超过文本区宽（字号过大/列数过多）
+    LAY_FONT_H = 3,       // 单字高度超过文本区高（字号过大/上区占比过小）
+    LAY_GRID = 4,         // 整体网格超出文本区（减少字数/增大上区占比/调小行距）
+    LAY_BAD_PARAM = 5,    // 参数非法
+};
+
 struct TextPlan {
     bool ok{ false };
     int cols{ 5 };
     int rows{ 1 };
     float used_S{ SINGLE_CHAR_MIN };
     float used_sp{ CHAR_SPACING };
+    float row_spacing{ 0.0f };   // 实际行间距 mm；0 表示沿用 used_sp（自动排版保持旧行为）
     float top_ratio{ TEXT_TOP_RATIO };
+    int err{ LAY_OK };           // 排版失败原因码
+    int dir{ 0 };                // 生效书写方向：0=横排左起, 1=竖排右起
     WorkArea text_area;
     std::vector<Offset> offsets;
 };

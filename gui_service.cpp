@@ -369,7 +369,10 @@ json snapshot() {
         { "pose_source", "软件位姿（最后有效 ACK）" },
         { "safe_area", { g_safeArea.xmin, g_safeArea.xmax, g_safeArea.ymin, g_safeArea.ymax } },
         { "z_up", Z_UP }, { "z_normal", Z_DOWN_NORMAL },
-        { "writing_plane_z", g_writing_plane_z }, { "writing_plane_valid", g_writing_plane_valid } };
+        { "writing_plane_z", g_writing_plane_z }, { "writing_plane_valid", g_writing_plane_valid },
+        { "layout_mode", g_layout_mode }, { "layout_char_size", g_lm_char_size },
+        { "layout_cols", g_lm_cols }, { "layout_top_ratio", g_lm_top_ratio },
+        { "layout_row_spacing", g_lm_row_spacing }, { "write_dir", g_write_dir } };
     j["memory"] = "未接入";
     j["storage"] = "未接入";
     j["battery"] = "未接入";
@@ -563,6 +566,56 @@ bool set_writing_plane(float z, std::string& err) {
     return true;
 }
 
+// —— 四角标定：抬笔移到 (x,y) 预览某角（真机会移动到该处；DRYRUN 仅打帧）—— //
+bool preview_corner(float x, float y, std::string& err) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    if (g_task_active) { err = "任务运行中，请先停止任务"; return false; }
+    if (!g_dryRun && !g_port.is_open()) { err = "串口未连接"; return false; }
+    if (!std::isfinite(x) || !std::isfinite(y)) { err = "坐标无效"; return false; }
+    // 预览落在“已固定的书写平面”高度（笔尖触纸，便于核对角位）；未设平面则用抬笔高度。
+    float z = g_writing_plane_valid ? g_writing_plane_z : Z_UP;
+    if (!inXYRange(x, y, g_devLimit) || !inZRange(z + Z_OFFSET)) {
+        std::ostringstream os; os << "预览点越界（X " << g_devLimit.xmin << "~" << g_devLimit.xmax
+            << "，Y " << g_devLimit.ymin << "~" << g_devLimit.ymax
+            << "，含偏移后 Z=" << (z + Z_OFFSET) << " 有效 " << g_z_bottom << "~" << g_z_top << "）";
+        err = os.str(); return false;
+    }
+    session_id();
+    bool ok = g_port.sendPointRetry(Point{ x, y, z, false, (uint8_t)SPEED_LEVEL, "CORNER-PREVIEW" });
+    err = ok ? "" : "预览移动失败（无应答）";
+    return ok;
+}
+
+// —— 四角标定：固定第 i 个角并持久化（robot_config.json，下次开 GUI 沿用）—— //
+bool save_corner(int i, float x, float y, std::string& err) {
+    if (i < 0 || i >= (int)trail::kCorners) { err = "角序号无效"; return false; }
+    if (!std::isfinite(x) || !std::isfinite(y)) { err = "坐标无效"; return false; }
+    if (!inXYRange(x, y, g_devLimit)) { err = "坐标越界，未保存"; return false; }
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        session_id();
+        trail::setCorner(i, x, y);
+        json ev = op_event("corner_save", nullptr);
+        ev["parameters"] = { { "index", i }, { "x", x }, { "y", y } };
+        ev["result"] = "ok";
+        audit_locked(ev);
+    }
+    cfg_save();
+    return true;
+}
+
+void clear_corners() {
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mu);
+        session_id();
+        trail::clearCorners();
+        json ev = op_event("corner_clear", nullptr);
+        ev["result"] = "ok";
+        audit_locked(ev);
+    }
+    cfg_save();
+}
+
 void request_estop() {
     g_estop = true;
     std::lock_guard<std::recursive_mutex> lk(g_mu);
@@ -598,12 +651,15 @@ json preflight(const std::string& utf8_text) {
     bool ok = prepare_layout_only(wtext, plan, chars);
     json r;
     r["layout_ok"] = ok;
+    r["mode"] = (g_layout_mode == 1) ? "manual" : "auto";
+    r["dir"] = g_write_dir;
     if (ok) {
         r["char_count"] = (int)chars.size();
         r["cols"] = plan.cols;
         r["rows"] = plan.rows;
         r["char_size"] = plan.used_S;
         r["spacing"] = plan.used_sp;
+        r["row_spacing"] = plan.row_spacing;
         r["speed"] = SPEED_LEVEL;
         r["dry_run"] = g_dryRun;
         r["layout"] = "上区书写 / 下区绘画";
@@ -611,12 +667,49 @@ json preflight(const std::string& utf8_text) {
     }
     else {
         r["error"] = "排版失败（字数过多或区域不足）";
+        r["err_code"] = plan.err;
     }
     json ev = op_event("task_preflight", nullptr);
-    ev["parameters"] = { { "text", utf8_text } };
+    ev["parameters"] = { { "text", utf8_text }, { "mode", r["mode"] }, { "dir", g_write_dir } };
     ev["result"] = ok ? "ok" : "fail";
-    if (!ok) ev["error_code"] = "layout";
+    if (!ok) { ev["error_code"] = "layout"; ev["err_code"] = plan.err; }
     audit_locked(ev);
+    return r;
+}
+
+// 实时排版预览：不写审计、不改持久化，仅据当前文本与排版设置返回预检明细与叠画字块。
+// 供 GUI 书写页输入文字/调整字号布局时即时刷新（cells 为世界坐标 mm，绘制端自行缩放到画布）。
+json layout_preview(const std::string& utf8_text) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    std::wstring wtext = utf8_to_w(utf8_text);
+    TextPlan plan; std::wstring chars;
+    bool ok = prepare_layout_only(wtext, plan, chars);
+    json r;
+    r["mode"] = (g_layout_mode == 1) ? "manual" : "auto";
+    r["dir"] = plan.dir;
+    r["valid"] = ok;
+    r["err_code"] = plan.err;
+    r["char_count"] = (int)chars.size();
+    r["cols"] = plan.cols;
+    r["rows"] = plan.rows;
+    r["char_size"] = plan.used_S;
+    r["spacing"] = plan.used_sp;
+    r["row_spacing"] = plan.row_spacing;
+    r["text_area"] = json{ { "xmin", plan.text_area.xmin }, { "xmax", plan.text_area.xmax },
+                           { "ymin", plan.text_area.ymin }, { "ymax", plan.text_area.ymax } };
+    json cells = json::array();
+    if (ok) {
+        for (size_t i = 0; i < plan.offsets.size() && i < chars.size(); ++i) {
+            std::wstring one(1, chars[i]);
+            cells.push_back(json{
+                { "x", plan.text_area.xmin + plan.offsets[i].x },
+                { "y", plan.text_area.ymin + plan.offsets[i].y },
+                { "s", plan.used_S },
+                { "idx", (int)i },
+                { "ch", w_to_utf8(one) } });
+        }
+    }
+    r["cells"] = cells;
     return r;
 }
 
@@ -802,6 +895,40 @@ bool set_z_offset(float v) {
     if (!std::isfinite(v) || v < -100.0f || v > 100.0f) return false;
     Z_OFFSET = v; cfg_save(); return true;
 }
+bool set_layout_mode(int mode) {
+    if (g_task_active) return false;
+    if (mode != 0 && mode != 1) return false;
+    g_layout_mode = mode; cfg_save(); return true;
+}
+bool set_layout_char_size(float v) {
+    if (g_task_active) return false;
+    if (!std::isfinite(v)) return false;
+    if (v < SINGLE_CHAR_MIN) v = SINGLE_CHAR_MIN;   // 60mm 比赛红线
+    if (v > 500.f) v = 500.f;
+    g_lm_char_size = v; cfg_save(); return true;
+}
+bool set_layout_cols(int v) {
+    if (g_task_active) return false;
+    if (v < 1 || v > 200) return false;
+    g_lm_cols = v; cfg_save(); return true;
+}
+bool set_layout_top_ratio(float v) {
+    if (g_task_active) return false;
+    if (!std::isfinite(v)) return false;
+    v = clampf(v, 0.10f, 0.95f);
+    g_lm_top_ratio = v; cfg_save(); return true;
+}
+bool set_layout_row_spacing(float v) {
+    if (g_task_active) return false;
+    if (!std::isfinite(v)) return false;
+    v = clampf(v, 0.0f, 50.0f);
+    g_lm_row_spacing = v; cfg_save(); return true;
+}
+bool set_write_dir(int dir) {
+    if (g_task_active) return false;
+    if (dir != 0 && dir != 1) return false;
+    g_write_dir = dir; cfg_save(); return true;
+}
 void toggle_auto_draw()    { if (!g_task_active) { g_autoDraw = !g_autoDraw; cfg_save(); } }
 void toggle_high_quality() { if (!g_task_active) { g_highQuality = !g_highQuality; cfg_save(); } }
 void toggle_enable_dip()   { if (!g_task_active) { g_enableDip = !g_enableDip; cfg_save(); } }
@@ -833,7 +960,13 @@ bool cfg_save() {
     j["min_point_interval_ms"] = g_min_point_interval_ms;
     j["writing_plane_z"]       = g_writing_plane_z;
     j["writing_plane_valid"]   = g_writing_plane_valid;
-    j["paper"]        = trail::paperToJson();   // ★实时轨迹：纸张边界持久化（下次开 GUI 沿用）
+    j["layout_mode"]           = g_layout_mode;
+    j["layout_char_size"]      = g_lm_char_size;
+    j["layout_cols"]           = g_lm_cols;
+    j["layout_top_ratio"]      = g_lm_top_ratio;
+    j["layout_row_spacing"]    = g_lm_row_spacing;
+    j["write_dir"]             = g_write_dir;
+    j["corners"]      = trail::calibToJson();     // ★实时轨迹：四角标定持久化（下次开 GUI 沿用）
     std::ofstream ofs("robot_config.json");
     if (!ofs) { wprintln(L"[警告] 配置保存失败：robot_config.json 无法写入。"); return false; }
     ofs << j.dump(2);
@@ -886,6 +1019,30 @@ void cfg_load() {
                 g_writing_plane_valid = j.value("writing_plane_valid", false);
             }
         }
+        if (j.contains("layout_mode") && j["layout_mode"].is_number_integer()) {
+            int m = j["layout_mode"].get<int>();
+            if (m == 0 || m == 1) g_layout_mode = m;
+        }
+        if (j.contains("layout_char_size") && j["layout_char_size"].is_number()) {
+            float v = j["layout_char_size"].get<float>();
+            if (std::isfinite(v) && v >= SINGLE_CHAR_MIN && v <= 500.0f) g_lm_char_size = v;
+        }
+        if (j.contains("layout_cols") && j["layout_cols"].is_number_integer()) {
+            int v = j["layout_cols"].get<int>();
+            if (v >= 1 && v <= 200) g_lm_cols = v;
+        }
+        if (j.contains("layout_top_ratio") && j["layout_top_ratio"].is_number()) {
+            float v = j["layout_top_ratio"].get<float>();
+            if (std::isfinite(v)) g_lm_top_ratio = clampf(v, 0.10f, 0.95f);
+        }
+        if (j.contains("layout_row_spacing") && j["layout_row_spacing"].is_number()) {
+            float v = j["layout_row_spacing"].get<float>();
+            if (std::isfinite(v)) g_lm_row_spacing = clampf(v, 0.0f, 50.0f);
+        }
+        if (j.contains("write_dir") && j["write_dir"].is_number_integer()) {
+            int d = j["write_dir"].get<int>();
+            if (d == 0 || d == 1) g_write_dir = d;
+        }
         if (j.contains("ink") && j["ink"].is_array() && j["ink"].size() == 4) {
             g_ink = InkStation{ j["ink"][0].get<float>(), j["ink"][1].get<float>(),
                                 j["ink"][2].get<float>(), j["ink"][3].get<bool>() };
@@ -910,7 +1067,7 @@ void cfg_load() {
                 g_center_x = x; g_center_y = y; g_center_z = z;
             }
         }
-        if (j.contains("paper")) trail::paperFromJson(j["paper"]);   // ★实时轨迹：沿用上次纸张边界
+        if (j.contains("corners")) trail::calibFromJson(j["corners"]);   // ★实时轨迹：沿用上次四角标定
         wprintln(L"[信息] 已加载配置 robot_config.json。");
     }
     catch (...) { wprintln(L"[警告] 配置文件解析失败，使用默认设置。"); }

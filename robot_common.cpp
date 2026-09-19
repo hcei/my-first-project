@@ -31,6 +31,14 @@ float g_z_bottom = -410.0f;     // 设备最下可动 Z（下限保护，-385 �
 float g_writing_plane_z = -385.0f;   // 落笔接触深度（raw，不含 Z_OFFSET）
 bool  g_writing_plane_valid = false;
 
+// —— 手动排版（默认自动，行为不变；GUI 切手动后置 1 并持久化）—— //
+int   g_layout_mode    = 0;        // 0=自动, 1=手动
+float g_lm_char_size   = SINGLE_CHAR_MIN; // 60
+int   g_lm_cols        = 5;
+float g_lm_top_ratio   = 0.46f;
+float g_lm_row_spacing = 8.0f;
+int   g_write_dir      = 0;        // 0=横排左起(默认现状), 1=竖排右起
+
 std::string HANZI_BASE_DIR = "D:/objects/hanzi-writer-data"; // HanziWriter 数据根
 std::string THEME_NAME = "jiangxue";                          // 主题
 
