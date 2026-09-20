@@ -62,7 +62,7 @@ static const int INFO_ROW_MAX = 44;    // 设备信息行距上限（多余高�
 static const int INFO_LABEL_W = 88;    // 设备信息标签列宽（容纳 4 字标签）
 static const int INFO_VALUE_DX = 94;   // 设备信息值列相对标签起点的偏移
 static const int CONNECT_PANEL_H = 246;// 连接页面板高度
-static const int WRITE_PANEL_H = 372;  // 书写页面板高度（含排版实时控件）
+static const int WRITE_PANEL_H = 300;  // 书写页面板高度（仅字号+朝向+操作+状态，画布更大便于拖拽）
 static const int PLANE_PANEL_H = 280;  // 书写平面页面板高度
 static const int BTN_H = 40, BTN_PITCH = 52;
 static const int CHK_H = 24, CHK_PITCH = 30;
@@ -193,6 +193,7 @@ enum {
     IDC_EDIT_PLANE_Z, IDC_BTN_PLANE_PREVIEW, IDC_BTN_PLANE_SAVE,
     IDC_CHECK_MANUAL, IDC_EDIT_LAY_CS, IDC_EDIT_LAY_COLS, IDC_EDIT_LAY_TOPR, IDC_EDIT_LAY_ROWSP,
     IDC_BTN_LAY_APPLY, IDC_BTN_LAY_AUTO, IDC_CHECK_VERT,
+    IDC_COMBO_ORIENT, IDC_BTN_RESETCANVAS,
     ID_PAGE_HOME = 2001, ID_PAGE_CONNECT, ID_PAGE_WRITE, ID_PAGE_PLANE,
     IDT_TIMER = 3001,
 };
@@ -223,15 +224,32 @@ static HWND g_btns[64] = {};            // ID 映射辅助
 static HWND g_checks[16] = {};
 static HWND g_cornerEdits[8] = {};      // 四角标定输入：[i*2]=角i X，[i*2+1]=角i Y
 
-// —— 排版实时预览（书写页）—— //
-static HWND g_chkManual = nullptr;      // “手动排版”复选框（独立句柄，不占 g_checks 槽位）
-static HWND g_chkVert = nullptr;        // “竖排(右起)”复选框（独立句柄）
-static HWND g_layEdits[4] = {};         // 字号/每行字数/上区占比/行距 输入框
-struct PrevCell { float x{ 0 }, y{ 0 }, s{ 0 }; std::wstring ch; };  // 计划字块（世界坐标 mm）
+// —— 自由拖拽排版（书写页）—— //
+static HWND g_editCharSize = nullptr;   // 字号 mm 输入框（唯一保留的排版数值控件）
+static HWND g_comboOrient  = nullptr;   // 书写方向（字体朝向）下拉：4 个朝向
+struct PrevCell { float x{ 0 }, y{ 0 }, s{ 0 }; std::wstring ch; };  // 计划字块（世界坐标 mm，x/y 为左下角）
 static std::vector<PrevCell> g_prevCells;
-static bool g_prevValid = false;        // 预览有效（非任务中且排得下）
+static bool g_prevValid = false;        // 预览有效（非任务中且字号塞得进视野）
 static bool g_laySuppress = false;      // 预填控件值时抑制 EN_CHANGE 回环
 static void RefreshLayoutPreview();
+
+// 固定视野下“世界 mm ↔ 屏幕像素”的映射缓存：DrawTrailPanel 每帧写入，拖拽命中/换算复用。
+struct TrailView {
+    RECT plot{};                        // 画布绘图区（客户区坐标）
+    float minx{ 0 }, maxx{ 0 }, miny{ 0 }, maxy{ 0 };   // 固定世界视野
+    float s{ 1 }, baseX{ 0 }, baseY{ 0 };               // 缩放与原点
+    bool  ok{ false };
+};
+static TrailView g_tv;
+static inline int  tvMapX(float wx) { return (int)(g_tv.baseX + (wx - g_tv.minx) * g_tv.s); }
+static inline int  tvMapY(float wy) { return (int)(g_tv.baseY + (g_tv.maxy - wy) * g_tv.s); }
+static inline float tvUnmapX(int px) { return g_tv.minx + (px - g_tv.baseX) / g_tv.s; }
+static inline float tvUnmapY(int py) { return g_tv.maxy - (py - g_tv.baseY) / g_tv.s; }
+
+// 拖拽状态：仅“规划态”（非任务中、无轨迹、预览有效）可拖。
+static bool  g_dragging = false;
+static int   g_dragIdx = -1;
+static float g_dragOffX = 0, g_dragOffY = 0;   // 按下点相对字块左下角的世界偏移（防抓取跳变）
 
 // ★实时轨迹面板：UI 侧显示缓冲 + 增量游标（epoch 变化表示任务已 reset，需全量重建）
 static std::vector<gs::trail::Cpt> g_dispCmd;
@@ -543,17 +561,17 @@ static WritePlot WritePlotGeo(const RECT& rc) {
     return p;
 }
 
-// —— 书写页左栏「排版」控件几何：DrawWrite 画标签、CreateWriteControls 建控件，均用同一函数，杜绝错位 —— //
-static const wchar_t* LAY_LABELS[4] = { L"字号 mm", L"每行字数", L"上区占比", L"行距 mm" };
+// —— 书写页左栏控件几何：字号 + 书写方向 + 操作 + 状态。DrawWrite 画标签、CreateWriteControls 建控件，均用同一函数，杜绝错位 —— //
+static const wchar_t* ORIENT_LABELS[4] = {
+    L"沿 Y 轴向下（正常）", L"沿 Y 轴向上（倒置）", L"沿 X 轴向上（顺时针）", L"沿 X 轴向下（逆时针）" };
 struct WriteLayoutGeo {
     int innerX, innerW;
-    int textY, textH;
-    int labY, edY;
-    int fx[4], fw[4];                       // 四列输入框 x / 宽
-    int chkX, chkY, chkW;
-    int applyX, applyW, autoX, autoW, btnY, btnH;
-    int vertX, vertW;                       // “竖排(右起)”复选框（与“手动排版”同行）
-    int actionY;                            // 预检/开始/停止行
+    int textY, textH;                       // 文本输入框
+    int row2Y;                              // 字号 / 方向 / 重置 行
+    int csLabW, csEdX, csEdW;               // “字号 mm”标签宽 + 输入框
+    int orLabX, orLabW, orComboX, orComboW; // “书写方向”标签 + 下拉
+    int resetX, resetW, resetH;             // “重置画布”按钮
+    int actionY;                            // 预检 / 开始 / 停止 行
     int statusY, statusH;                   // 只读状态框
 };
 static WriteLayoutGeo WLGeo(const RECT& rc) {
@@ -561,15 +579,13 @@ static WriteLayoutGeo WLGeo(const RECT& rc) {
     WriteLayoutGeo L{};
     L.innerX = g.innerX; L.innerW = g.innerW;
     L.textY = g.top + 46; L.textH = 64;
-    L.labY = g.top + 120; L.edY = g.top + 142;
-    int gap = 10; int colw = (g.innerW - gap * 3) / 4;
-    for (int i = 0; i < 4; ++i) { L.fx[i] = g.innerX + i * (colw + gap); L.fw[i] = colw; }
-    L.chkX = g.innerX; L.chkY = g.top + 174; L.chkW = 96;
-    L.btnH = 28; L.btnY = g.top + 172; L.applyW = 72; L.autoW = 96;
-    L.applyX = g.innerX + L.chkW + 10; L.autoX = L.applyX + L.applyW + 8;
-    L.vertX = L.autoX + L.autoW + 12; L.vertW = 120;
-    L.actionY = g.top + 210;
-    L.statusY = g.top + 256;
+    L.row2Y = g.top + 120;
+    L.csLabW = 60; L.csEdW = 64; L.csEdX = g.innerX + L.csLabW;
+    L.orLabX = L.csEdX + L.csEdW + 18; L.orLabW = 72;
+    L.orComboX = L.orLabX + L.orLabW; L.orComboW = 168;
+    L.resetH = 28; L.resetW = 84; L.resetX = g.innerX + g.innerW - L.resetW;
+    L.actionY = g.top + 158;
+    L.statusY = g.top + 208;
     L.statusH = (g.top + g.panelH - PANEL_PAD) - L.statusY; if (L.statusH < 40) L.statusH = 40;
     return L;
 }
@@ -583,6 +599,34 @@ static void RefreshTrail() {
     }
     g_cmdCursor = gs::trail::fetchCommanded(g_cmdCursor, g_dispCmd);
     g_actCursor = gs::trail::fetchActual(g_actCursor, g_dispAct);
+}
+
+// 以 (cx,cy) 为中心旋转绘制单个字形（预览“字体朝向”用）。
+// 关键：先把字形“正立”地居中画到 (cx,cy)，再用世界变换绕 (cx,cy) 旋转——
+// 这样无论转 0/90/180/270 度，字形视觉中心始终落在框中心（旧的字面 escapement 做法在
+// 90/270 度时会让字形偏到框上部，故改为世界变换旋转）。angleTenths 为十分之一度、正值顺时针。
+static void DrawRotatedGlyph(HDC dc, int cx, int cy, int angleTenths,
+                             const std::wstring& ch, int hpx, COLORREF col) {
+    int gm = SetGraphicsMode(dc, GM_ADVANCED);
+    XFORM oldXf{}; bool restoreXf = false;
+    if (gm == GM_ADVANCED) restoreXf = (GetWorldTransform(dc, &oldXf) != 0);
+    double rad = angleTenths * (3.14159265358979 / 1800.0);
+    float c = (float)std::cos(rad), s = (float)std::sin(rad);
+    XFORM xf;
+    xf.eM11 = c;  xf.eM12 = s;  xf.eM21 = -s; xf.eM22 = c;
+    xf.eDx = (float)cx - (c * cx - s * cy);   // 绕 (cx,cy) 旋转：平移补偿使中心为不动点
+    xf.eDy = (float)cy - (s * cx + c * cy);
+    SetWorldTransform(dc, &xf);
+    HFONT f = CreateFontW(-hpx, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                          0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
+    HFONT of = (HFONT)SelectObject(dc, f);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, col);
+    int half = hpx * 2; if (half < 12) half = 12;
+    RECT r{ cx - half, cy - half, cx + half, cy + half };   // 关于中心对称 → 正立字形居中于 (cx,cy)
+    DrawTextW(dc, ch.c_str(), -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
+    SelectObject(dc, of); DeleteObject(f);
+    if (restoreXf) SetWorldTransform(dc, &oldXf);
+    SetGraphicsMode(dc, gm);   // 恢复原图形模式（默认 COMPATIBLE 会忽略世界变换，后续轨迹线不受影响）
 }
 
 static void DrawTrailPanel(HDC dc, const WritePlot& p) {
@@ -601,37 +645,14 @@ static void DrawTrailPanel(HDC dc, const WritePlot& p) {
     FillRect(dc, &pr, g_brWhite);
     rr(dc, pr.left, pr.top, pr.right - pr.left, pr.bottom - pr.top, 10, LINE);
 
-    // 世界坐标外接框：优先按已下发轨迹；无轨迹但已标四角→按四角；都无→设备极限
+    // 固定视野（预览与书写共用，不再按数据自动缩放）：优先四角标定框，未标定回退可达 X±162/Y±85。
     gs::trail::Corner cs[gs::trail::kCorners];
     gs::trail::getCorners(cs);
-    float cbminx, cbminy, cbmaxx, cbmaxy;
-    bool haveCorner = gs::trail::cornersBounds(cbminx, cbminy, cbmaxx, cbmaxy);
-    bool haveData = (gs::trail::commandedSize() > 0);
     float minx, miny, maxx, maxy;
-    if (haveData) {
-        gs::trail::bounds(minx, miny, maxx, maxy);
-        if (haveCorner) {
-            minx = std::min(minx, cbminx); maxx = std::max(maxx, cbmaxx);
-            miny = std::min(miny, cbminy); maxy = std::max(maxy, cbmaxy);
-        }
-    } else if (haveCorner) {
-        minx = cbminx; miny = cbminy; maxx = cbmaxx; maxy = cbmaxy;
-    } else {
-        gs::trail::bounds(minx, miny, maxx, maxy);   // 设备极限（空态参考）
-    }
-    // 排版预览叠画：仅“未跑过任务（无任何下发轨迹）+ 非任务中 + 排得下”时显示计划字块；
-    // 一旦任务跑过（有下发点）就不再叠画，避免计划字形/方框与真实轨迹重叠冲突。
-    bool overlayOn = (g_prevValid && !gs::task_active() && gs::trail::commandedSize() == 0);
-    if (overlayOn) {
-        for (const auto& c : g_prevCells) {
-            minx = std::min(minx, c.x);     maxx = std::max(maxx, c.x + c.s);
-            miny = std::min(miny, c.y);     maxy = std::max(maxy, c.y + c.s);
-        }
-    }
-    const float MINSPAN = 20.f;
-    if (maxx - minx < MINSPAN) { float c = (minx + maxx) / 2; minx = c - MINSPAN / 2; maxx = c + MINSPAN / 2; }
-    if (maxy - miny < MINSPAN) { float c = (miny + maxy) / 2; miny = c - MINSPAN / 2; maxy = c + MINSPAN / 2; }
+    gs::view_bounds(minx, miny, maxx, maxy);
     float ww = maxx - minx, wh = maxy - miny;
+    if (ww < 1) ww = 1;
+    if (wh < 1) wh = 1;
 
     const int PAD = 18;
     float availW = (float)(pr.right - pr.left) - PAD * 2; if (availW < 10) availW = 10;
@@ -641,6 +662,13 @@ static void DrawTrailPanel(HDC dc, const WritePlot& p) {
     float baseY = pr.top + PAD + (availH - wh * s) / 2;
     auto mapX = [&](float wx) { return (int)(baseX + (wx - minx) * s); };
     auto mapY = [&](float wy) { return (int)(baseY + (maxy - wy) * s); };   // Y 轴向上
+    // 缓存固定映射，供拖拽命中/坐标换算复用（与绘制完全同源，杜绝错位）。
+    g_tv.plot = pr; g_tv.minx = minx; g_tv.maxx = maxx; g_tv.miny = miny; g_tv.maxy = maxy;
+    g_tv.s = s; g_tv.baseX = baseX; g_tv.baseY = baseY; g_tv.ok = true;
+
+    // 计划字块叠画（可拖拽）：只要有字块 + 非任务中 + 无历史轨迹就显示（**允许重叠也照画**，
+    // 字号大到排不下时不再隐藏，交给用户拖拽分开）；一旦任务跑过就不再叠画，避免与真实轨迹冲突。
+    bool overlayOn = (!g_prevCells.empty() && !gs::task_active() && gs::trail::commandedSize() == 0);
 
     int saved = SaveDC(dc);
 
@@ -687,24 +715,25 @@ static void DrawTrailPanel(HDC dc, const WritePlot& p) {
         SelectObject(dc, old); DeleteObject(pnAx);
     }
 
-    // 计划排版叠画（背景层，位于实测/指令轨迹之下）：紫色点线字块 + 框内自适应字形
+    // 计划排版叠画（背景层，位于实测/指令轨迹之下）：紫色点线字块 + 框内自适应字形（按书写方向旋转）
     if (overlayOn) {
-        HPEN pnPl = CreatePen(PS_DOT, 1, PURPLE);
-        HPEN opP = (HPEN)SelectObject(dc, pnPl);
-        HBRUSH obP = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-        for (const auto& c : g_prevCells) {
-            Rectangle(dc, mapX(c.x), mapY(c.y + c.s), mapX(c.x + c.s), mapY(c.y));
+        int orient = gs::glyph_orient() & 3;
+        const int esc[4] = { 0, 1800, 900, 2700 };   // 预览字形旋转角（十分一度），与书写路径朝向一致
+        for (size_t i = 0; i < g_prevCells.size(); ++i) {
+            const auto& c = g_prevCells[i];
+            int L = mapX(c.x), R = mapX(c.x + c.s), T = mapY(c.y + c.s), B = mapY(c.y);
+            bool drag = ((int)i == g_dragIdx);
+            HPEN pen = CreatePen(drag ? PS_SOLID : PS_DOT, drag ? 2 : 1, PURPLE);
+            HPEN opP = (HPEN)SelectObject(dc, pen);
+            HBRUSH obP = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+            Rectangle(dc, L, T, R, B);
+            SelectObject(dc, opP); SelectObject(dc, obP); DeleteObject(pen);
         }
-        SelectObject(dc, opP); SelectObject(dc, obP); DeleteObject(pnPl);
         for (const auto& c : g_prevCells) {
-            RECT cr{ mapX(c.x), mapY(c.y + c.s), mapX(c.x + c.s), mapY(c.y) };
+            int cxp = (mapX(c.x) + mapX(c.x + c.s)) / 2;
+            int cyp = (mapY(c.y) + mapY(c.y + c.s)) / 2;
             int fh = (int)(c.s * s * 0.62f + 0.5f); if (fh < 9) fh = 9; if (fh > 200) fh = 200;
-            HFONT f = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                                  0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei");
-            HFONT of = (HFONT)SelectObject(dc, f);
-            SetBkMode(dc, TRANSPARENT); SetTextColor(dc, PURPLE_DARK);
-            DrawTextW(dc, c.ch.c_str(), -1, &cr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(dc, of); DeleteObject(f);
+            DrawRotatedGlyph(dc, cxp, cyp, esc[orient], c.ch, fh, PURPLE_DARK);
         }
     }
 
@@ -781,10 +810,10 @@ static void DrawWrite(HDC dc, RECT& rc) {
 
     Panel(dc, g.leftX, g.top, g.colW, g.panelH);
     Text(dc, L"输入与排版预览", g.innerX, g.top + 6, 300, 34, INK, 24, true);
-    // 排版字段标签（坐标与 CreateWriteControls 同源，杜绝错位）
+    // 字号 / 书写方向 标签（坐标与 CreateWriteControls 同源，杜绝错位）
     WriteLayoutGeo L = WLGeo(rc);
-    for (int i = 0; i < 4; ++i)
-        Text(dc, LAY_LABELS[i], L.fx[i], L.labY, L.fw[i], 20, INK, 14, true);
+    Text(dc, L"字号 mm", L.innerX, L.row2Y + 3, L.csLabW, 22, INK, 14, true);
+    Text(dc, L"书写方向", L.orLabX, L.row2Y + 3, L.orLabW, 22, INK, 14, true);
 
     Panel(dc, g.rightX, g.top, g.colW, g.panelH);
     Text(dc, L"任务进度", g.rightX + PANEL_PAD, g.top + 6, 300, 34, INK, 24, true);
@@ -1019,10 +1048,11 @@ static void DestroyPageControls() {
     if (g_editPreview) { DestroyWindow(g_editPreview); g_editPreview = nullptr; }
     if (g_editPlaneZ) { DestroyWindow(g_editPlaneZ); g_editPlaneZ = nullptr; }
     for (auto& e : g_cornerEdits) if (e) { DestroyWindow(e); e = nullptr; }
-    if (g_chkManual) { DestroyWindow(g_chkManual); g_chkManual = nullptr; }
-    if (g_chkVert) { DestroyWindow(g_chkVert); g_chkVert = nullptr; }
-    for (auto& e : g_layEdits) if (e) { DestroyWindow(e); e = nullptr; }
+    if (g_editCharSize) { DestroyWindow(g_editCharSize); g_editCharSize = nullptr; }
+    if (g_comboOrient) { DestroyWindow(g_comboOrient); g_comboOrient = nullptr; }
     g_prevCells.clear(); g_prevValid = false;
+    g_dragging = false; g_dragIdx = -1;
+    g_tv.ok = false;
 }
 
 static HWND MakeCheck(HWND parent, int id, const wchar_t* text, int x, int y, int w, int h) {
@@ -1128,33 +1158,24 @@ static void CreateWriteControls(HWND hwnd) {
     std::string last = gs::load_last_task_text();
     if (!last.empty()) SetWindowTextW(g_editText, to_ws(last).c_str());
 
-    // 排版四输入（预填当前手动值）
-    const int lids[4] = { IDC_EDIT_LAY_CS, IDC_EDIT_LAY_COLS, IDC_EDIT_LAY_TOPR, IDC_EDIT_LAY_ROWSP };
-    for (int i = 0; i < 4; ++i) {
-        HWND e = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                 L.fx[i], L.edY, L.fw[i], 26, hwnd, (HMENU)(INT_PTR)lids[i], nullptr, nullptr);
-        SendMessage(e, WM_SETFONT, (WPARAM)g_font16, TRUE);
-        std::wstring v;
-        if (i == 0) v = f1((float)snapD("cfg", "layout_char_size", 60.0), 0);
-        if (i == 1) v = std::to_wstring(snapI("cfg", "layout_cols", 5));
-        if (i == 2) v = f1((float)snapD("cfg", "layout_top_ratio", 0.46), 2);
-        if (i == 3) v = f1((float)snapD("cfg", "layout_row_spacing", 8.0), 1);
-        SetWindowTextW(e, v.c_str());
-        g_layEdits[i] = e;
-    }
-    // “手动排版”复选框（独立句柄，不占 g_checks）
-    g_chkManual = CreateWindowW(L"BUTTON", L"手动排版", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                                L.chkX, L.chkY, L.chkW, 26, hwnd, (HMENU)(INT_PTR)IDC_CHECK_MANUAL, nullptr, nullptr);
-    SendMessage(g_chkManual, WM_SETFONT, (WPARAM)g_font16, TRUE);
-    SendMessage(g_chkManual, BM_SETCHECK, snapI("cfg", "layout_mode", 0) == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
-    MakeBtn(hwnd, { L"应用", IDC_BTN_LAY_APPLY, PURPLE }, L.applyX, L.btnY, L.applyW, L.btnH);
-    MakeBtn(hwnd, { L"恢复自动", IDC_BTN_LAY_AUTO, BLUE }, L.autoX, L.btnY, L.autoW, L.btnH);
-    // “竖排(右起)”方向复选框（独立于自动/手动模式）
-    g_chkVert = CreateWindowW(L"BUTTON", L"竖排(右起)", WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
-                              L.vertX, L.chkY, L.vertW, 26, hwnd, (HMENU)(INT_PTR)IDC_CHECK_VERT, nullptr, nullptr);
-    SendMessage(g_chkVert, WM_SETFONT, (WPARAM)g_font16, TRUE);
-    SendMessage(g_chkVert, BM_SETCHECK, snapI("cfg", "write_dir", 0) == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
+    // 字号输入（预填当前自由布局字号）
+    g_editCharSize = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                     L.csEdX, L.row2Y, L.csEdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_LAY_CS, nullptr, nullptr);
+    SendMessage(g_editCharSize, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editCharSize, f1((float)snapD("cfg", "free_char_size", 60.0), 0).c_str());
+
+    // 书写方向（字体朝向）下拉：4 个朝向，预置当前值
+    g_comboOrient = CreateWindowW(L"COMBOBOX", L"",
+                                  WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+                                  L.orComboX, L.row2Y, L.orComboW, 240, hwnd, (HMENU)(INT_PTR)IDC_COMBO_ORIENT, nullptr, nullptr);
+    SendMessage(g_comboOrient, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    for (int i = 0; i < 4; ++i)
+        SendMessageW(g_comboOrient, CB_ADDSTRING, 0, (LPARAM)ORIENT_LABELS[i]);
+    SendMessageW(g_comboOrient, CB_SETCURSEL, (WPARAM)snapI("cfg", "glyph_orient", 0), 0);
+
+    // 重置画布：清空实时轨迹缓冲，让可编辑字块叠画重新出现（跑过一次任务后可再次编辑）
+    MakeBtn(hwnd, { L"重置画布", IDC_BTN_RESETCANVAS, BLUE }, L.resetX, L.row2Y, L.resetW, 26);
 
     // 操作按钮行：预检 / 开始 / 停止
     int bbw = (g.innerW - 24 * 2) / 3;
@@ -1236,47 +1257,63 @@ static std::wstring GetEditW(HWND e) {
 
 // 把 layout_preview 结果格式化为中文状态串（回显到只读状态框）
 static std::wstring BuildPreviewStatus(const nlohmann::json& r) {
-    bool manual = r.value("mode", std::string("auto")) == "manual";
-    std::wstring m = manual ? L"手动" : L"自动";
-    std::wstring d = (r.value("dir", 0) == 1) ? L"竖排右起" : L"横排左起";
     int cnt = r.value("char_count", 0);
-    if (cnt == 0) return L"请输入要书写的汉字后查看排版预览。";
+    int orient = r.value("orient", 0);
+    std::wstring od = (orient >= 0 && orient < 4) ? ORIENT_LABELS[orient] : L"—";
+    if (cnt == 0)
+        return L"请输入要书写的汉字；随后在下方画布内拖拽每个字块调整布局（须落在黄色视野框内）。";
+    float vw = 0, vh = 0;
+    try {
+        auto& v = r.at("view");
+        vw = (float)v.at("x1").get<double>() - (float)v.at("x0").get<double>();
+        vh = (float)v.at("y1").get<double>() - (float)v.at("y0").get<double>();
+    } catch (...) {}
+    std::wstring head = fmt(L"方向：%s　|　%d 字，字号 %s mm，可写视野 %s×%s mm。",
+                            od.c_str(), cnt, f1((float)r.value("char_size", 0.0)).c_str(),
+                            f1(vw).c_str(), f1(vh).c_str());
     if (!r.value("valid", false)) {
         int ec = r.value("err_code", 0);
-        std::wstring why = L"排版不可行";
-        if (ec == LAY_FONT_W) why = L"单字宽度超出文本区（减小字号或每行字数）";
-        else if (ec == LAY_FONT_H) why = L"单字高度超出文本区（减小字号或增大上区占比）";
-        else if (ec == LAY_GRID) why = L"整体网格放不下（减少字数 / 增大上区占比 / 调小行距）";
-        else if (ec == LAY_BAD_PARAM) why = L"参数非法（字号需 ≥60mm）";
-        return fmt(L"模式：%s　|　方向：%s　|　排版不可行：%s。", m.c_str(), d.c_str(), why.c_str());
+        std::wstring why = (ec == LAY_FONT_W) ? L"字号超出可书写视野（请调小字号）" : L"排版不可行";
+        return head + L"不可行：" + why + L"。";
     }
-    std::wstring grid = (r.value("dir", 0) == 1)
-        ? fmt(L"每列 %d 字 · %d 列", r.value("cols", 0), r.value("rows", 0))
-        : fmt(L"%d 列 × %d 行", r.value("cols", 0), r.value("rows", 0));
-    return fmt(L"模式：%s　|　方向：%s　|　%d 字，%s，字号 %s mm，字距 %s mm，行距 %s mm。可放下 ✓",
-               m.c_str(), d.c_str(), cnt, grid.c_str(),
-               f1((float)r.value("char_size", 0.0)).c_str(),
-               f1((float)r.value("spacing", 0.0)).c_str(),
-               f1((float)r.value("row_spacing", 0.0)).c_str());
+    return head + L"拖拽字块定位（自动磁吸对齐），改字号会重排初始布局。";
 }
 
-// 解析四个排版输入框并写入服务层（空值跳过，不改动该项）
-static void ApplyLayoutFields() {
-    if (g_layEdits[0]) { std::wstring v = GetEditW(g_layEdits[0]); if (!v.empty()) gs::set_layout_char_size((float)_wtof(v.c_str())); }
-    if (g_layEdits[1]) { std::wstring v = GetEditW(g_layEdits[1]); if (!v.empty()) gs::set_layout_cols((int)_wtof(v.c_str())); }
-    if (g_layEdits[2]) { std::wstring v = GetEditW(g_layEdits[2]); if (!v.empty()) gs::set_layout_top_ratio((float)_wtof(v.c_str())); }
-    if (g_layEdits[3]) { std::wstring v = GetEditW(g_layEdits[3]); if (!v.empty()) gs::set_layout_row_spacing((float)_wtof(v.c_str())); }
+// EN_CHANGE：仅当输入已达合法字号(≥60)时实时套用；**不回写文本**——否则打字会被打断
+// （如想输 “80”，首字符 “8”<60 若被夹回 “60” 就再也打不出任何值）。
+static void ApplyCharSizeField() {
+    if (!g_editCharSize) return;
+    std::wstring v = GetEditW(g_editCharSize);
+    if (v.empty()) return;
+    float f = (float)_wtof(v.c_str());
+    if (f < SINGLE_CHAR_MIN) return;               // 还没打到 ≥60：不套用、也不改框，让用户继续输入
+    if (f > 500.f) f = 500.f;
+    gs::set_free_char_size(f);
+}
+// EN_KILLFOCUS：离开输入框时才把值夹到 [60,500] 并回写生效值（此时打字已结束，回写安全），
+// 顺带在越界时给提示（60mm 是比赛每字≥6×6cm 的下限）。
+static void CommitCharSizeField() {
+    if (!g_editCharSize) return;
+    std::wstring v = GetEditW(g_editCharSize);
+    float f = v.empty() ? SINGLE_CHAR_MIN : (float)_wtof(v.c_str());
+    float eff = clampf(f, SINGLE_CHAR_MIN, 500.f);
+    gs::set_free_char_size(eff);
+    g_laySuppress = true;
+    SetWindowTextW(g_editCharSize, f1(eff, 0).c_str());
+    g_laySuppress = false;
+    if (std::fabs(eff - f) > 0.01f)
+        SetResult(eff <= SINGLE_CHAR_MIN ? L"字号下限为 60mm（比赛要求每字≥6×6cm），已自动取 60。"
+                                         : L"字号已限制在有效范围（60~500mm）。");
 }
 
 // 实时刷新排版预览：任务运行中冻结（不改全局、不叠画）；否则据当前文本重算并缓存字块 + 回显状态
 static void RefreshLayoutPreview() {
     if (!g_st.hwnd) return;
-    if (gs::task_active()) { g_prevValid = false; g_prevCells.clear(); return; }
+    if (gs::task_active()) { g_prevValid = false; g_prevCells.clear(); g_dragging = false; g_dragIdx = -1; return; }
     std::wstring t = g_editText ? GetEditW(g_editText) : L"";
     nlohmann::json r = gs::layout_preview(to_u8(t));
-    g_prevCells.clear(); g_prevValid = false;
-    if (r.value("valid", false) && r.contains("cells")) {
-        g_prevValid = true;
+    g_prevCells.clear(); g_prevValid = r.value("valid", false);
+    if (r.contains("cells")) {                     // 无论是否“可行”都取回字块：允许重叠、可拖拽分开
         for (auto& c : r["cells"]) {
             PrevCell pc;
             pc.x = c.value("x", 0.0); pc.y = c.value("y", 0.0); pc.s = c.value("s", 0.0);
@@ -1286,6 +1323,50 @@ static void RefreshLayoutPreview() {
     }
     if (g_editPreview) SetWindowTextW(g_editPreview, BuildPreviewStatus(r).c_str());
     InvalidateRect(g_st.hwnd, nullptr, FALSE);
+}
+
+// —— 字块拖拽辅助 —— //
+// 仅“规划态”可拖：书写页 + 固定视野就绪 + 有字块 + 非任务中 + 无历史轨迹（允许重叠也可拖开）。
+static bool CanDragCells() {
+    return g_st.page == ID_PAGE_WRITE && g_tv.ok && !g_prevCells.empty()
+        && !gs::task_active() && gs::trail::commandedSize() == 0;
+}
+// 命中测试：返回包含屏幕点 (px,py) 的字块下标（取最后绘制者=上层），无则 -1。
+static int HitCell(int px, int py) {
+    if (!g_tv.ok) return -1;
+    for (int i = (int)g_prevCells.size() - 1; i >= 0; --i) {
+        const auto& c = g_prevCells[i];
+        int L = tvMapX(c.x), R = tvMapX(c.x + c.s), T = tvMapY(c.y + c.s), B = tvMapY(c.y);
+        if (px >= L && px <= R && py >= T && py <= B) return i;
+    }
+    return -1;
+}
+// 单轴磁吸：把 pos（字块左/下边）的左/右/中三锚点向候选线吸附，取阈值内最近者。
+static void snapAxis(float& pos, float s, const std::vector<float>& targets, float thr) {
+    const float anchors[3] = { pos, pos + s, pos + s / 2 };
+    bool found = false; float best = 0;
+    for (float t : targets) for (float a : anchors) {
+        float d = t - a;
+        if (std::fabs(d) <= thr && (!found || std::fabs(d) < std::fabs(best))) { best = d; found = true; }
+    }
+    if (found) pos += best;
+}
+// 对拖拽中的字块做 X/Y 磁吸（对齐其它字边/中心 + 视野边/中心）。
+static void SnapCell(int idx, float& x, float& y) {
+    if (idx < 0 || idx >= (int)g_prevCells.size()) return;
+    float s = g_prevCells[idx].s;
+    float thr = 6.0f / g_tv.s;                 // ≈6 像素的磁吸阈值（换算到世界 mm）
+    float x0, y0, x1, y1; gs::view_bounds(x0, y0, x1, y1);
+    std::vector<float> tx = { x0, x1, (x0 + x1) / 2 };
+    std::vector<float> ty = { y0, y1, (y0 + y1) / 2 };
+    for (int j = 0; j < (int)g_prevCells.size(); ++j) {
+        if (j == idx) continue;
+        const auto& o = g_prevCells[j];
+        tx.push_back(o.x); tx.push_back(o.x + o.s); tx.push_back(o.x + o.s / 2);
+        ty.push_back(o.y); ty.push_back(o.y + o.s); ty.push_back(o.y + o.s / 2);
+    }
+    snapAxis(x, s, tx, thr);
+    snapAxis(y, s, ty, thr);
 }
 
 static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
@@ -1413,46 +1494,11 @@ static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
         else SetResult(L"Z_OFFSET 输入无效（需 -100~100）。", true);
         break;
     }
-    case IDC_CHECK_MANUAL: {
-        bool manual = (SendMessage(g_chkManual, BM_GETCHECK, 0, 0) == BST_CHECKED);
-        if (gs::task_active()) {
-            SendMessage(g_chkManual, BM_SETCHECK, manual ? BST_UNCHECKED : BST_CHECKED, 0);
-            SetResult(L"任务运行中，不能切换排版模式。", true); break;
-        }
-        if (manual) ApplyLayoutFields();               // 切手动前把当前输入落地为生效值
-        gs::set_layout_mode(manual ? 1 : 0);
+    case IDC_BTN_RESETCANVAS: {
+        if (gs::task_active()) { SetResult(L"任务运行中，不能重置画布。", true); break; }
+        gs::reset_canvas();               // 清空实时轨迹缓冲 → 可编辑字块叠画重新出现
         RefreshLayoutPreview();
-        SetResult(manual ? L"已切换为手动排版（按字号/每行/上区占比/行距严格排布）。"
-                         : L"已切换为自动排版（沿用原自动搜索）。");
-        break;
-    }
-    case IDC_BTN_LAY_APPLY: {
-        if (gs::task_active()) { SetResult(L"任务运行中，不能修改排版。", true); break; }
-        bool manual = (SendMessage(g_chkManual, BM_GETCHECK, 0, 0) == BST_CHECKED);
-        gs::set_layout_mode(manual ? 1 : 0);
-        ApplyLayoutFields();
-        RefreshLayoutPreview();
-        SetResult(L"排版已应用。");
-        break;
-    }
-    case IDC_BTN_LAY_AUTO: {
-        if (gs::task_active()) { SetResult(L"任务运行中，不能修改排版。", true); break; }
-        gs::set_layout_mode(0);
-        if (g_chkManual) SendMessage(g_chkManual, BM_SETCHECK, BST_UNCHECKED, 0);
-        RefreshLayoutPreview();
-        SetResult(L"已恢复自动排版。");
-        break;
-    }
-    case IDC_CHECK_VERT: {
-        bool vert = (SendMessage(g_chkVert, BM_GETCHECK, 0, 0) == BST_CHECKED);
-        if (gs::task_active()) {
-            SendMessage(g_chkVert, BM_SETCHECK, vert ? BST_UNCHECKED : BST_CHECKED, 0);
-            SetResult(L"任务运行中，不能切换书写方向。", true); break;
-        }
-        gs::set_write_dir(vert ? 1 : 0);       // 方向独立于自动/手动模式
-        RefreshLayoutPreview();
-        SetResult(vert ? L"书写方向：竖排·右起（列内从上到下，列从右往左）。"
-                       : L"书写方向：横排·左起。");
+        SetResult(L"画布已重置，可重新拖拽字块排布。");
         break;
     }
     case IDC_BTN_PLANE_PREVIEW: {
@@ -1507,20 +1553,20 @@ static void DoPreflight(HWND hwnd) {
     if (t.empty()) { SetResult(L"请先输入文本。", true); return; }
     nlohmann::json r = gs::preflight(to_u8(t));
     std::wstring out;
-    bool manual = r.value("mode", std::string("auto")) == "manual";
+    int orient = r.value("orient", 0);
+    std::wstring od = (orient >= 0 && orient < 4) ? ORIENT_LABELS[orient] : L"—";
     if (r.value("layout_ok", false)) {
-        out = fmt(L"排版可行（%s）：%d 字，%d 列 × %d 行，字号 %s mm，字距 %s mm，行距 %s mm，速度 %d 档。\r\n布局：上区书写 / 下区绘画。%s\r\n（预检不发送任何运动指令）",
-                  manual ? L"手动" : L"自动",
-                  r.value("char_count", 0), r.value("cols", 0), r.value("rows", 0),
+        out = fmt(L"预检通过（自由拖拽排版）：%d 字，字号 %s mm，字体朝向：%s，速度 %d 档。\r\n%s%s\r\n（预检不发送任何运动指令；书写按画布所见即所得）",
+                  r.value("char_count", 0),
                   f1((float)r.value("char_size", 0.0)).c_str(),
-                  f1((float)r.value("spacing", 0.0)).c_str(),
-                  f1((float)r.value("row_spacing", 0.0)).c_str(),
+                  od.c_str(),
                   r.value("speed", 3),
-                  r.value("dry_run", false) ? L"当前 Dry Run。" : L"当前真机模式。");
+                  to_ws(r.value("layout", std::string())).c_str(),
+                  r.value("dry_run", false) ? L"（当前 Dry Run）" : L"（当前真机模式）");
         SetResult(L"预检通过。");
     }
     else {
-        out = L"排版失败：字数过多或区域不足（详见实时预览）。";
+        out = fmt(L"预检失败：%s。", to_ws(r.value("error", std::string("排版不可行"))).c_str());
         SetResult(L"预检失败。", true);
     }
     if (g_editPreview) SetWindowTextW(g_editPreview, out.c_str());
@@ -1578,10 +1624,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int code = HIWORD(wp);
         HWND ctl = (HWND)lp;
         // 排版实时预览：书写页编辑框 EN_CHANGE（输入即刷新），预填回环期忽略
-        if (code == EN_CHANGE && g_st.page == ID_PAGE_WRITE && !g_laySuppress) {
-            if (ctl == g_editText) { RefreshLayoutPreview(); return 0; }
-            for (int i = 0; i < 4; ++i)
-                if (ctl == g_layEdits[i]) { ApplyLayoutFields(); RefreshLayoutPreview(); return 0; }
+        if (g_st.page == ID_PAGE_WRITE && !g_laySuppress) {
+            if (code == EN_CHANGE && ctl == g_editText) { RefreshLayoutPreview(); return 0; }
+            if (code == EN_CHANGE && ctl == g_editCharSize) { ApplyCharSizeField(); RefreshLayoutPreview(); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editCharSize) { CommitCharSizeField(); RefreshLayoutPreview(); return 0; }
+            if (code == CBN_SELCHANGE && id == IDC_COMBO_ORIENT) {
+                int sel = (int)SendMessageW(g_comboOrient, CB_GETCURSEL, 0, 0);
+                if (gs::task_active()) {
+                    SendMessageW(g_comboOrient, CB_SETCURSEL, (WPARAM)gs::glyph_orient(), 0);
+                    SetResult(L"任务运行中，不能切换书写方向。", true);
+                } else {
+                    gs::set_glyph_orient(sel);
+                    RefreshLayoutPreview();
+                    if (sel >= 0 && sel < 4) SetResult(fmt(L"书写方向（字体朝向）：%s。", ORIENT_LABELS[sel]));
+                }
+                return 0;
+            }
         }
         // 书写页“预检任务”与主页“查询位姿”共用 ID，按页面分流
         if (id == IDC_BTN_QUERY && g_st.page == ID_PAGE_WRITE) { DoPreflight(hwnd); return 0; }
@@ -1611,16 +1669,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
+        // 书写页：命中计划字块则开始拖拽（仅规划态）
+        if (CanDragCells()) {
+            int hi = HitCell(x, y);
+            if (hi >= 0) {
+                g_dragging = true; g_dragIdx = hi;
+                float wx = tvUnmapX(x), wy = tvUnmapY(y);
+                g_dragOffX = wx - g_prevCells[hi].x;
+                g_dragOffY = wy - g_prevCells[hi].y;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+        }
         break;
     }
     case WM_MOUSEMOVE: {
         int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+        if (g_dragging && g_dragIdx >= 0 && g_dragIdx < (int)g_prevCells.size()) {
+            float s = g_prevCells[g_dragIdx].s;
+            float nx = tvUnmapX(x) - g_dragOffX, ny = tvUnmapY(y) - g_dragOffY;
+            SnapCell(g_dragIdx, nx, ny);
+            float x0, y0, x1, y1; gs::view_bounds(x0, y0, x1, y1);   // 夹取在固定视野内
+            nx = (s <= x1 - x0) ? clampf(nx, x0, x1 - s) : x0;
+            ny = (s <= y1 - y0) ? clampf(ny, y0, y1 - s) : y0;
+            g_prevCells[g_dragIdx].x = nx; g_prevCells[g_dragIdx].y = ny;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         int hover = -1;
         if (x < NAV_W && y > TITLE_H) {
             int idx = (y - TITLE_H - 14) / 58;
             if (idx >= 0 && idx < NAV_N) hover = idx;
         }
         if (hover != g_st.navHover) { g_st.navHover = hover; InvalidateRect(hwnd, nullptr, FALSE); }
+        // 规划态下悬停在字块上给移动光标提示
+        if (CanDragCells() && hover < 0)
+            SetCursor(HitCell(x, y) >= 0 ? LoadCursor(nullptr, IDC_SIZEALL) : LoadCursor(nullptr, IDC_ARROW));
+        break;
+    }
+    case WM_LBUTTONUP: {
+        if (g_dragging) {
+            g_dragging = false;
+            ReleaseCapture();
+            if (g_dragIdx >= 0 && g_dragIdx < (int)g_prevCells.size())
+                gs::set_free_cell(g_dragIdx, g_prevCells[g_dragIdx].x, g_prevCells[g_dragIdx].y);
+            g_dragIdx = -1;
+            RefreshLayoutPreview();
+            return 0;
+        }
         break;
     }
     case WM_SIZE:

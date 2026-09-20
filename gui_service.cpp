@@ -77,6 +77,14 @@ bool             g_auto_draw_used = false;
 std::string      g_task_error;
 int              g_dip_count = 0;
 
+// —— 自由拖拽排版状态（GUI 书写页；仅本层使用，随 robot_config.json 持久化）—— //
+std::wstring         g_free_text;                 // 当前自由布局对应的“有效汉字序列”（宽字符）
+std::vector<Offset>  g_free_cells;                // 每字左下角世界坐标（x,y），size == g_free_text.size()
+float                g_free_char_size = SINGLE_CHAR_MIN;  // 全局字号 mm（≥60）
+int                  g_glyph_orient   = 0;        // 字体朝向 0..3
+constexpr float      REACH_X = 162.0f;            // 未标定四角时的可达回退半宽（真机实测 X±162）
+constexpr float      REACH_Y = 85.0f;             // 未标定四角时的可达回退半高（真机实测 Y±85）
+
 std::string now_compact() {   // 20260917_101520
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
@@ -372,7 +380,8 @@ json snapshot() {
         { "writing_plane_z", g_writing_plane_z }, { "writing_plane_valid", g_writing_plane_valid },
         { "layout_mode", g_layout_mode }, { "layout_char_size", g_lm_char_size },
         { "layout_cols", g_lm_cols }, { "layout_top_ratio", g_lm_top_ratio },
-        { "layout_row_spacing", g_lm_row_spacing }, { "write_dir", g_write_dir } };
+        { "layout_row_spacing", g_lm_row_spacing }, { "write_dir", g_write_dir },
+        { "free_char_size", g_free_char_size }, { "glyph_orient", g_glyph_orient } };
     j["memory"] = "未接入";
     j["storage"] = "未接入";
     j["battery"] = "未接入";
@@ -642,74 +651,213 @@ bool abort_task() {
 }
 bool task_canceled() { return g_task_cancel; }
 
+// 前向声明：自由布局构造（定义见下方“自由拖拽排版”段），供 preflight 复用。
+static bool prepare_free_layout(const std::wstring& wtext, TextPlan& plan, std::wstring& chars);
+static bool grid_fits(int n, float S);
+
 // ---------------- 写字任务 ----------------
 json preflight(const std::string& utf8_text) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     session_id();
     std::wstring wtext = utf8_to_w(utf8_text);
     TextPlan plan; std::wstring chars;
-    bool ok = prepare_layout_only(wtext, plan, chars);
+    bool ok = prepare_free_layout(wtext, plan, chars);
+    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
+    // 可行 = 有字 且 按字号能放进固定视野（放不下不自动缩放，仅报不可行）。
+    bool fits = ok && grid_fits((int)chars.size(), plan.used_S);
     json r;
-    r["layout_ok"] = ok;
-    r["mode"] = (g_layout_mode == 1) ? "manual" : "auto";
-    r["dir"] = g_write_dir;
-    if (ok) {
+    r["layout_ok"] = fits;
+    r["mode"] = "free";
+    r["orient"] = g_glyph_orient;
+    r["view"] = json{ { "x0", x0 }, { "y0", y0 }, { "x1", x1 }, { "y1", y1 } };
+    if (fits) {
         r["char_count"] = (int)chars.size();
-        r["cols"] = plan.cols;
-        r["rows"] = plan.rows;
         r["char_size"] = plan.used_S;
-        r["spacing"] = plan.used_sp;
-        r["row_spacing"] = plan.row_spacing;
         r["speed"] = SPEED_LEVEL;
         r["dry_run"] = g_dryRun;
-        r["layout"] = "上区书写 / 下区绘画";
+        r["layout"] = "自由拖拽排版（所见即所得）";
         r["text"] = w_to_utf8(chars);
     }
     else {
-        r["error"] = "排版失败（字数过多或区域不足）";
-        r["err_code"] = plan.err;
+        r["error"] = ok ? "字号超出可书写视野" : "无有效汉字";
+        r["err_code"] = ok ? LAY_FONT_W : LAY_NO_CHARS;
     }
     json ev = op_event("task_preflight", nullptr);
-    ev["parameters"] = { { "text", utf8_text }, { "mode", r["mode"] }, { "dir", g_write_dir } };
-    ev["result"] = ok ? "ok" : "fail";
-    if (!ok) { ev["error_code"] = "layout"; ev["err_code"] = plan.err; }
+    ev["parameters"] = { { "text", utf8_text }, { "mode", r["mode"] }, { "orient", g_glyph_orient } };
+    ev["result"] = fits ? "ok" : "fail";
+    if (!fits) { ev["error_code"] = "layout"; ev["err_code"] = r.value("err_code", 0); }
     audit_locked(ev);
     return r;
 }
+
+// ---------------- 自由拖拽排版（GUI 书写页） ----------------
+// 固定视野：优先四角外接框（gs::trail），未标定（角不足 4）回退可达框 X±162/Y±85。
+void view_bounds(float& x0, float& y0, float& x1, float& y1) {
+    float mnx, mny, mxx, mxy;
+    if (trail::cornersBounds(mnx, mny, mxx, mxy) && trail::cornerCount() >= 4) {
+        x0 = mnx; y0 = mny; x1 = mxx; y1 = mxy;
+    } else {
+        x0 = -REACH_X; y0 = -REACH_Y; x1 = REACH_X; y1 = REACH_Y;
+    }
+    if (x1 < x0) std::swap(x0, x1);
+    if (y1 < y0) std::swap(y0, y1);
+}
+
+// 把字块左下角夹取到视野内（保证整块 S×S 落在 [x0,x1]×[y0,y1]）。
+static void clamp_cell(float& x, float& y, float S, float x0, float y0, float x1, float y1) {
+    float lo_x = x0, hi_x = x1 - S, lo_y = y0, hi_y = y1 - S;
+    if (hi_x < lo_x) hi_x = lo_x;                 // 字比视野还大：贴左边
+    if (hi_y < lo_y) hi_y = lo_y;
+    x = clampf(x, lo_x, hi_x);
+    y = clampf(y, lo_y, hi_y);
+}
+
+// 可行性判定：**允许字块互相重叠**——只要单个字块塞得进固定视野（字号 ≤ 视野宽/高）即算可行。
+// 字多到排不下时不再判不可行，而是重叠摆放、交给用户拖拽分开；仅当单字比视野还大才不可行。
+static bool grid_fits(int n, float S) {
+    if (n <= 0) return true;
+    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
+    float vw = x1 - x0, vh = y1 - y0;
+    return (S > 0 && S <= vw + 1e-3f && S <= vh + 1e-3f);
+}
+
+// 初始网格摆位：按字号 S 在视野内宽优先换行、整体居中；**始终生成 n 个字块**（放不下则夹取到
+// 视野内、允许重叠），是否真放得下由 grid_fits 判定。S 非法时兜底最小字号，保证 out.size()==n。
+static void compute_initial_grid(int n, float S, std::vector<Offset>& out) {
+    out.clear();
+    if (n <= 0) return;
+    if (!(S > 0)) S = SINGLE_CHAR_MIN;
+    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
+    float vw = x1 - x0, vh = y1 - y0;
+    const float g = 2.0f;
+    int per = (int)std::floor((vw + g) / (S + g)); if (per < 1) per = 1; if (per > n) per = n;
+    int rows = (n + per - 1) / per;
+    float gridW = per * S + (per - 1) * g;
+    float gridH = rows * S + (rows - 1) * g;
+    float ox = x0 + std::max(0.f, (vw - gridW) / 2.0f);
+    float topY = y1 - std::max(0.f, (vh - gridH) / 2.0f);
+    out.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        int r = i / per, c = i % per;
+        float cx = ox + c * (S + g);
+        float cy = topY - S - r * (S + g);           // 左下角 y
+        clamp_cell(cx, cy, S, x0, y0, x1, y1);
+        out.push_back(Offset{ cx, cy });
+    }
+}
+
+// 把字块中心按朝向做整数旋转（方框 [0,S]×[0,S]，绕中心 (S/2,S/2)，y 轴向上）。
+// orient: 0=0°、1=180°、2=90°CW、3=90°CCW。旋转后仍落在同一 S×S 方框内。
+static void rotate_local(float& x, float& y, float S, int orient) {
+    switch (orient) {
+    case 1:  x = S - x; y = S - y; break;            // 180°
+    case 2:  { float nx = S - y, ny = x; x = nx; y = ny; } break;  // 90° 顺时针
+    case 3:  { float nx = y, ny = S - x; x = nx; y = ny; } break;  // 90° 逆时针
+    default: break;                                  // 0°：不变
+    }
+}
+
+// 供 run_task_thread：用自由布局构造 TextPlan（offsets 即每字左下角世界绝对坐标）。
+static bool prepare_free_layout(const std::wstring& wtext, TextPlan& plan, std::wstring& chars) {
+    chars.clear();
+    for (wchar_t c : wtext) if (isCJKOrPunct(c)) chars.push_back(c);
+    if (chars.empty()) return false;
+    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
+    if (g_free_text != chars || g_free_cells.size() != chars.size()) {
+        // 文本变了（或状态漂移）→ 重算初始网格；放不下不阻断书写路径的坐标，仅尽量夹取。
+        compute_initial_grid((int)chars.size(), g_free_char_size, g_free_cells);
+        g_free_text = chars;
+    }
+    plan = TextPlan();
+    plan.ok = true;
+    plan.used_S = g_free_char_size;
+    plan.cols = (int)chars.size(); plan.rows = 1;
+    plan.dir = 0;
+    plan.text_area = WorkArea{ 0.f, 0.f, 0.f, 0.f };   // 原点零：offsets 已是绝对世界坐标
+    plan.offsets.clear();
+    for (size_t i = 0; i < chars.size(); ++i) {
+        float cx = g_free_cells[i].x, cy = g_free_cells[i].y;
+        clamp_cell(cx, cy, g_free_char_size, x0, y0, x1, y1);
+        plan.offsets.push_back(Offset{ cx, cy });
+    }
+    return true;
+}
+
+bool set_free_char_size(float mm) {
+    if (g_task_active) return false;
+    if (!std::isfinite(mm)) return false;
+    if (mm < SINGLE_CHAR_MIN) mm = SINGLE_CHAR_MIN;   // 60mm 比赛红线
+    if (mm > 500.f) mm = 500.f;
+    g_free_char_size = mm;
+    compute_initial_grid((int)g_free_text.size(), g_free_char_size, g_free_cells);  // 复位摆位
+    cfg_save();
+    return true;
+}
+bool set_free_cell(int idx, float x, float y) {
+    if (g_task_active) return false;
+    if (idx < 0 || idx >= (int)g_free_cells.size()) return false;
+    if (!std::isfinite(x) || !std::isfinite(y)) return false;
+    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
+    clamp_cell(x, y, g_free_char_size, x0, y0, x1, y1);
+    g_free_cells[idx] = Offset{ x, y };
+    cfg_save();
+    return true;
+}
+bool set_glyph_orient(int o) {
+    if (g_task_active) return false;
+    if (o < 0 || o > 3) return false;
+    g_glyph_orient = o;
+    cfg_save();
+    return true;
+}
+int  glyph_orient() { return g_glyph_orient; }
+void reset_canvas() { trail::reset(); }
 
 // 实时排版预览：不写审计、不改持久化，仅据当前文本与排版设置返回预检明细与叠画字块。
 // 供 GUI 书写页输入文字/调整字号布局时即时刷新（cells 为世界坐标 mm，绘制端自行缩放到画布）。
 json layout_preview(const std::string& utf8_text) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     std::wstring wtext = utf8_to_w(utf8_text);
-    TextPlan plan; std::wstring chars;
-    bool ok = prepare_layout_only(wtext, plan, chars);
+    std::wstring chars;
+    for (wchar_t c : wtext) if (isCJKOrPunct(c)) chars.push_back(c);
+    int n = (int)chars.size();
+    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
+    float S = g_free_char_size;
+
     json r;
-    r["mode"] = (g_layout_mode == 1) ? "manual" : "auto";
-    r["dir"] = plan.dir;
-    r["valid"] = ok;
-    r["err_code"] = plan.err;
-    r["char_count"] = (int)chars.size();
-    r["cols"] = plan.cols;
-    r["rows"] = plan.rows;
-    r["char_size"] = plan.used_S;
-    r["spacing"] = plan.used_sp;
-    r["row_spacing"] = plan.row_spacing;
-    r["text_area"] = json{ { "xmin", plan.text_area.xmin }, { "xmax", plan.text_area.xmax },
-                           { "ymin", plan.text_area.ymin }, { "ymax", plan.text_area.ymax } };
+    r["mode"] = "free";
+    r["orient"] = g_glyph_orient;
+    r["char_count"] = n;
+    r["char_size"] = S;
+    r["view"] = json{ { "x0", x0 }, { "y0", y0 }, { "x1", x1 }, { "y1", y1 } };
     json cells = json::array();
-    if (ok) {
-        for (size_t i = 0; i < plan.offsets.size() && i < chars.size(); ++i) {
-            std::wstring one(1, chars[i]);
-            cells.push_back(json{
-                { "x", plan.text_area.xmin + plan.offsets[i].x },
-                { "y", plan.text_area.ymin + plan.offsets[i].y },
-                { "s", plan.used_S },
-                { "idx", (int)i },
-                { "ch", w_to_utf8(one) } });
-        }
+
+    if (n == 0) {
+        r["valid"] = false;
+        r["err_code"] = LAY_NO_CHARS;
+        r["cells"] = cells;
+        return r;
+    }
+    // 文本变了 → 重算初始网格（复位拖拽）；否则复用已存坐标（拖拽/持久化结果）。
+    if (g_free_text != chars || g_free_cells.size() != (size_t)n) {
+        compute_initial_grid(n, S, g_free_cells);
+        g_free_text = chars;
+    }
+    // 可行性：按字号能否放进视野（放不下不自动缩放，仅置 valid=false 阻断开始书写）。
+    bool fits = grid_fits(n, S);
+    int m = (int)g_free_cells.size(); if (m > n) m = n;   // 防御：数量不符只画前 m 个
+    for (int i = 0; i < m; ++i) {
+        float cx = g_free_cells[i].x, cy = g_free_cells[i].y;
+        clamp_cell(cx, cy, S, x0, y0, x1, y1);
+        g_free_cells[i] = Offset{ cx, cy };
+        std::wstring one(1, chars[i]);
+        cells.push_back(json{
+            { "x", cx }, { "y", cy }, { "s", S },
+            { "idx", i }, { "ch", w_to_utf8(one) } });
     }
     r["cells"] = cells;
+    r["valid"] = fits;
+    r["err_code"] = fits ? LAY_OK : LAY_GRID;
     return r;
 }
 
@@ -755,8 +903,10 @@ static void run_task_thread(std::string text) {
         all_chars += cs;
     }
     if (all_chars.empty()) { end_task(false, "failed", "no_chars"); return; }
-    if (!prepare_layout_only(all_chars, plan, chars)) { end_task(false, "failed", "layout"); return; }
+    if (!prepare_free_layout(all_chars, plan, chars)) { end_task(false, "failed", "layout"); return; }
     task::begin(chars, plan, "write");
+    const float S = plan.used_S;              // 全局字号（自由布局）
+    const int   orient = g_glyph_orient;      // 字体朝向（整字旋转，仅改朝向不改位置）
 
     // 步骤 3：逐字流式书写（每字发送后更新进度）
     for (size_t ci = 0; ci < chars.size(); ++ci) {
@@ -769,13 +919,26 @@ static void run_task_thread(std::string text) {
             continue;
         }
         std::vector<Point> local;
-        if (!generateSingleCharTrajectory(ch, SPEED_LEVEL, local, ACTIVE_CHAR_SIZE)) continue;
+        if (!generateSingleCharTrajectory(ch, SPEED_LEVEL, local, S)) continue;
+
+        // 把字形局部外接框居中到 S×S 字格：generateSingleCharTrajectory 按最长边缩放到 S 并以
+        // bbox 左下角对齐 (0,0)，扁字（一/二/三）会贴到字格底部 → 与“居中”的预览框不一致、实写偏下。
+        // 这里补一个居中偏移，使实际落笔与拖拽字格所见即所得（填满格的字 dx/dy≈0，无影响）。
+        float minlx = 1e30f, maxlx = -1e30f, minly = 1e30f, maxly = -1e30f;
+        for (const auto& p : local) {
+            minlx = std::min(minlx, p.x); maxlx = std::max(maxlx, p.x);
+            minly = std::min(minly, p.y); maxly = std::max(maxly, p.y);
+        }
+        if (!(maxlx >= minlx && maxly >= minly)) { minlx = maxlx = minly = maxly = 0.f; }
+        const float dcx = S / 2 - (minlx + maxlx) / 2;
+        const float dcy = S / 2 - (minly + maxly) / 2;
 
         std::vector<Point> one; one.reserve(local.size() + 2);
-        const Offset& of = plan.offsets[(int)ci];
+        const Offset& of = plan.offsets[(int)ci];   // 该字左下角世界绝对坐标
         for (const auto& p : local) {
-            one.push_back(Point{ plan.text_area.xmin + of.x + p.x,
-                                 plan.text_area.ymin + of.y + p.y,
+            float lx = p.x + dcx, ly = p.y + dcy;   // 先居中到字格 [0,S]×[0,S]
+            rotate_local(lx, ly, S, orient);        // 再按朝向绕字心旋转
+            one.push_back(Point{ of.x + lx, of.y + ly,
                                  p.z, p.isPenDown, p.speed, p.zType });
         }
         task::traj_add_total(one.size());
@@ -966,6 +1129,15 @@ bool cfg_save() {
     j["layout_top_ratio"]      = g_lm_top_ratio;
     j["layout_row_spacing"]    = g_lm_row_spacing;
     j["write_dir"]             = g_write_dir;
+    // —— 自由拖拽排版（按文本绑定）—— //
+    j["free_text"]             = w_to_utf8(g_free_text);
+    j["free_char_size"]        = g_free_char_size;
+    j["glyph_orient"]          = g_glyph_orient;
+    {
+        json fc = json::array();
+        for (const auto& c : g_free_cells) fc.push_back(json{ { "x", c.x }, { "y", c.y } });
+        j["free_cells"] = fc;
+    }
     j["corners"]      = trail::calibToJson();     // ★实时轨迹：四角标定持久化（下次开 GUI 沿用）
     std::ofstream ofs("robot_config.json");
     if (!ofs) { wprintln(L"[警告] 配置保存失败：robot_config.json 无法写入。"); return false; }
@@ -1042,6 +1214,27 @@ void cfg_load() {
         if (j.contains("write_dir") && j["write_dir"].is_number_integer()) {
             int d = j["write_dir"].get<int>();
             if (d == 0 || d == 1) g_write_dir = d;
+        }
+        // —— 自由拖拽排版（按文本绑定）—— //
+        if (j.contains("free_char_size") && j["free_char_size"].is_number()) {
+            float v = j["free_char_size"].get<float>();
+            if (std::isfinite(v) && v >= SINGLE_CHAR_MIN && v <= 500.0f) g_free_char_size = v;
+        }
+        if (j.contains("glyph_orient") && j["glyph_orient"].is_number_integer()) {
+            int o = j["glyph_orient"].get<int>();
+            if (o >= 0 && o <= 3) g_glyph_orient = o;
+        }
+        if (j.contains("free_text") && j["free_text"].is_string())
+            g_free_text = utf8_to_w(j["free_text"].get<std::string>());
+        if (j.contains("free_cells") && j["free_cells"].is_array()) {
+            g_free_cells.clear();
+            for (auto& e : j["free_cells"]) {
+                if (!e.is_object()) continue;
+                float x = e.value("x", 0.0f), y = e.value("y", 0.0f);
+                if (std::isfinite(x) && std::isfinite(y)) g_free_cells.push_back(Offset{ x, y });
+            }
+            // 数量与文本不符则丢弃坐标，交由 layout_preview 重算初始网格。
+            if (g_free_cells.size() != g_free_text.size()) g_free_cells.clear();
         }
         if (j.contains("ink") && j["ink"].is_array() && j["ink"].size() == 4) {
             g_ink = InkStation{ j["ink"][0].get<float>(), j["ink"][1].get<float>(),

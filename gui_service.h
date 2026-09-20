@@ -90,7 +90,7 @@ json task_info();
 bool set_speed(int v);
 bool set_char_spacing(float v);
 bool set_z_offset(float v);
-// —— 手动排版（GUI 书写页实时调整；改动即存，任务运行中拒绝）—— //
+// —— 手动排版（旧网格模式；保留供控制台/回归，GUI 书写页已改用下方自由布局）—— //
 bool set_layout_mode(int mode);            // 0=自动, 1=手动
 bool set_layout_char_size(float mm);       // 字号 mm（≥60）
 bool set_layout_cols(int cols);            // 每行字数
@@ -98,6 +98,17 @@ bool set_layout_top_ratio(float ratio);    // 上区占比 0.10~0.95
 bool set_layout_row_spacing(float mm);     // 行间距 mm
 bool set_write_dir(int dir);               // 书写方向 0=横排左起, 1=竖排右起
 json layout_preview(const std::string& utf8_text);  // 实时预检明细 + 叠画计划字块（世界坐标）
+
+// —— 自由拖拽排版（GUI 书写页 2026-09-19 重构）—— //
+// 网格仅作“初始摆位”，用户可在固定视野（四角标定框，未标定回退可达 X±162/Y±85）内
+// 逐字拖拽定位；拖拽结果按文本绑定持久化，书写时所见即所得。
+// 视野矩形（世界 mm，x0<x1、y0<y1）：优先四角外接框，否则可达回退框。
+void view_bounds(float& x0, float& y0, float& x1, float& y1);
+bool set_free_char_size(float mm);         // 设定全局字号（≥60）→ 重算初始网格摆位（复位拖拽）
+bool set_free_cell(int idx, float x, float y);  // 拖拽更新第 idx 字左下角世界坐标（夹取在视野内）
+bool set_glyph_orient(int o);              // 字体朝向 0=沿y向下(0°)/1=沿y向上(180°)/2=沿x向上(90°CW)/3=沿x向下(90°CCW)
+int  glyph_orient();                       // 读取当前字体朝向
+void reset_canvas();                       // 清空实时轨迹缓冲，使可编辑字块叠画重新出现
 bool preview_writing_plane(float z, std::string& err);  // 移到 (0,0,z) 悬停，确认书写高度（不书写）
 bool set_writing_plane(float z, std::string& err);      // 保存书写平面 Z：生效 + 持久化（后续书写统一用该 Z）
 // —— 四角标定（实时轨迹面板）：预览=抬笔移到该角(真机移动)；保存=固定并持久化；清除=复位 —— //
