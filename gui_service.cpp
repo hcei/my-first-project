@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -62,7 +63,9 @@ int         g_current_attempt = 1;
 std::atomic_bool g_task_active{ false };
 std::atomic_bool g_task_cancel{ false };
 std::thread      g_task_thread;
-std::string      g_task_stage = "空闲";      // 预热/蘸墨/书写/描边/空闲
+std::string      g_task_stage = "空闲";      // 预热/蘸墨/书写/翻页/描边/空闲
+int              g_page_no = 0;               // 当前书写页 1-based（0=无任务/未开始）
+int              g_page_total = 0;            // 任务总页数
 int              g_chars_total = 0;
 int              g_chars_done  = 0;
 std::string      g_task_text;                 // UTF-8
@@ -77,13 +80,38 @@ bool             g_auto_draw_used = false;
 std::string      g_task_error;
 int              g_dip_count = 0;
 
-// —— 自由拖拽排版状态（GUI 书写页；仅本层使用，随 robot_config.json 持久化）—— //
-std::wstring         g_free_text;                 // 当前自由布局对应的“有效汉字序列”（宽字符）
-std::vector<Offset>  g_free_cells;                // 每字左下角世界坐标（x,y），size == g_free_text.size()
-float                g_free_char_size = SINGLE_CHAR_MIN;  // 全局字号 mm（≥60）
-int                  g_glyph_orient   = 0;        // 字体朝向 0..3
+// —— 自由拖拽排版 + 分页状态（GUI 书写页；仅本层使用，随 robot_config.json 持久化）—— //
+// g_full_all  = 过滤后的全量有效文本（不截断；容量缩小时也不丢，放大后可无损恢复）；
+// g_full_text = 当前实际参与书写的子串（= g_full_all 截断到容量），分页与书写的依据。
+std::wstring             g_full_all;
+std::wstring             g_full_text;               // 截断后的实际书写文本（宽字符）
+std::vector<PageEntry>   g_pages;                   // 每页文本 + 每字左下角世界坐标
+float                    g_free_char_size = SINGLE_CHAR_MIN;  // 全局字号 mm（≥60，各页共用）
+int                      g_glyph_orient   = 0;      // 字体朝向 0..3（各页共用）
+int                      g_page_chars  = 5;         // 每页字数 1~50
+int                      g_page_count  = 1;         // 总页数 1~20
+int                      g_page_turn_wait_ms = 3000;// 翻页模拟等待时长（蓝牙未接入）
+int                      g_edit_page   = 0;         // 编辑页游标（空闲时 GUI 拖拽所在页）
+std::atomic_int          g_write_page{ 0 };         // 书写页游标（任务线程正在写的页，UI 只读）
+std::atomic_bool         g_task_finished{ false };  // 本进程至少完成/中止过一次任务（叠画门控）
+PageTurnFn g_page_turn;   // 空 = 默认模拟等待（调用处兜底 page_turn_wait_locked）
 constexpr float      REACH_X = 162.0f;            // 未标定四角时的可达回退半宽（真机实测 X±162）
 constexpr float      REACH_Y = 85.0f;             // 未标定四角时的可达回退半高（真机实测 Y±85）
+
+// 翻页模拟：持锁分片睡眠（锁序 g_mu → trail 不受影响；snapshot 亦等锁，UI 随 500ms 定时器
+// 显示“翻页”阶段）。每 50ms 轮询取消/急停，命中即中止且不翻页（用户选定安全语义：立即中止）。
+// ★必须在持有 g_mu 的线程调用（任务线程）。蓝牙接入后可被注入回调整体替代。
+bool page_turn_wait_locked() {
+    const int total = g_page_turn_wait_ms;
+    int waited = 0;
+    while (waited < total) {
+        if (g_task_cancel || g_estop) return false;
+        int chunk = total - waited < 50 ? total - waited : 50;
+        std::this_thread::sleep_for(std::chrono::milliseconds(chunk));
+        waited += chunk;
+    }
+    return !(g_task_cancel || g_estop);
+}
 
 std::string now_compact() {   // 20260917_101520
     auto now = std::chrono::system_clock::now();
@@ -289,6 +317,16 @@ void begin(const std::wstring& chars, const TextPlan& plan, const char* kind) {
     g_task_error.clear();
     (void)kind;
 }
+// 分页任务：每页开始。页内“字符 x/y、轨迹点”计数复位（GUI 显示当前页进度），并记录页码。
+void page_begin(int page_idx0, int page_total, int chars_in_page) {
+    std::lock_guard<std::recursive_mutex> lk(g_mu);
+    g_page_no = page_idx0 + 1;
+    g_page_total = page_total;
+    g_chars_total = chars_in_page;
+    g_chars_done = 0;
+    g_traj_total = g_traj_done = 0;
+    g_pen_down = false;
+}
 void stage(const char* label) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     g_task_stage = label;
@@ -324,6 +362,7 @@ void end(bool ok, const char* state, const char* error) {
 void reset() {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     g_task_stage = "空闲"; g_chars_total = g_chars_done = 0;
+    g_page_no = g_page_total = 0;
     g_traj_total = g_traj_done = 0; g_pen_down = false;
     g_task_error.clear(); g_task_chars.clear(); g_task_text.clear();
     g_dip_count = 0;
@@ -360,6 +399,8 @@ json snapshot() {
     j["task"] = json{
         { "active", (bool)g_task_active },
         { "stage", g_task_stage },
+        { "page_no", g_page_no }, { "page_total", g_page_total },
+        { "display_page", g_task_active ? (int)g_write_page.load() : g_edit_page },
         { "chars_done", g_chars_done }, { "chars_total", g_chars_total },
         { "chars", g_task_chars },
         { "traj_done", g_traj_done }, { "traj_total", g_traj_total },
@@ -381,7 +422,12 @@ json snapshot() {
         { "layout_mode", g_layout_mode }, { "layout_char_size", g_lm_char_size },
         { "layout_cols", g_lm_cols }, { "layout_top_ratio", g_lm_top_ratio },
         { "layout_row_spacing", g_lm_row_spacing }, { "write_dir", g_write_dir },
-        { "free_char_size", g_free_char_size }, { "glyph_orient", g_glyph_orient } };
+        { "free_char_size", g_free_char_size }, { "glyph_orient", g_glyph_orient },
+        { "page_chars", g_page_chars }, { "page_count", g_page_count },
+        { "edit_page", g_edit_page }, { "page_turn_wait_ms", g_page_turn_wait_ms },
+        { "task_finished", (bool)g_task_finished },
+        { "text_total", (int)g_full_all.size() },
+        { "text_written", (int)g_full_text.size() } };
     j["memory"] = "未接入";
     j["storage"] = "未接入";
     j["battery"] = "未接入";
@@ -651,47 +697,85 @@ bool abort_task() {
 }
 bool task_canceled() { return g_task_cancel; }
 
-// 前向声明：自由布局构造（定义见下方“自由拖拽排版”段），供 preflight 复用。
-static bool prepare_free_layout(const std::wstring& wtext, TextPlan& plan, std::wstring& chars);
+// 前向声明：分页自由布局（定义见下方“自由拖拽排版 + 分页”段），供 preflight 复用。
+static std::wstring filter_page_chars(const std::wstring& wtext);
+static void ensure_page_grid(PageEntry& e, float S);
+static void rebuild_pages(const std::wstring& full);
+static bool prepare_page_plan(const PageEntry& e, TextPlan& plan);
 static bool grid_fits(int n, float S);
 
 // ---------------- 写字任务 ----------------
+// 预检（分页）：容量截断 → 重新切页（文本未变的页保留拖拽坐标）→ 逐页校验“有字且塞得进视野”。
 json preflight(const std::string& utf8_text) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
     session_id();
-    std::wstring wtext = utf8_to_w(utf8_text);
-    TextPlan plan; std::wstring chars;
-    bool ok = prepare_free_layout(wtext, plan, chars);
+    std::wstring all = filter_page_chars(utf8_to_w(utf8_text));
+    int cap = g_page_chars * g_page_count;
+    g_full_all  = all;
+    g_full_text = all.substr(0, std::min((size_t)cap, all.size()));
+    rebuild_pages(g_full_text);
+    int written = (int)g_full_text.size();
     float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
-    // 可行 = 有字 且 按字号能放进固定视野（放不下不自动缩放，仅报不可行）。
-    bool fits = ok && grid_fits((int)chars.size(), plan.used_S);
     json r;
-    r["layout_ok"] = fits;
     r["mode"] = "free";
     r["orient"] = g_glyph_orient;
     r["view"] = json{ { "x0", x0 }, { "y0", y0 }, { "x1", x1 }, { "y1", y1 } };
-    if (fits) {
-        r["char_count"] = (int)chars.size();
-        r["char_size"] = plan.used_S;
-        r["speed"] = SPEED_LEVEL;
-        r["dry_run"] = g_dryRun;
-        r["layout"] = "自由拖拽排版（所见即所得）";
-        r["text"] = w_to_utf8(chars);
+    r["page_total"]  = g_page_count;
+    r["written_pages"] = (written + g_page_chars - 1) / g_page_chars;
+    r["page_chars"]  = g_page_chars;
+    r["text_total"]  = (int)all.size();
+    r["truncated"]   = (int)all.size() > cap;
+    bool has = written > 0;
+    bool fits = true;
+    int  bad_page = 0;
+    int  wPages = (written + g_page_chars - 1) / g_page_chars;   // 有字要写的页数
+    for (int k = 0; k < wPages && k < (int)g_pages.size(); ++k) {
+        const auto& e = g_pages[k];
+        if (e.text.empty()) { fits = false; if (!bad_page) bad_page = (int)k + 1; break; }
+        if (!grid_fits((int)e.text.size(), g_free_char_size)) { fits = false; if (!bad_page) bad_page = (int)k + 1; }
+    }
+    r["layout_ok"] = has && fits;
+    if (has && fits) {
+        r["char_count"]   = (int)g_pages.size();
+        r["chars_planned"]= written;
+        r["char_size"]    = g_free_char_size;
+        r["speed"]        = SPEED_LEVEL;
+        r["dry_run"]      = g_dryRun;
+        r["layout"]       = "自由拖拽排版 · 分页（所见即所得）";
+        r["text"]         = w_to_utf8(g_full_text.substr(0, (size_t)written));
     }
     else {
-        r["error"] = ok ? "字号超出可书写视野" : "无有效汉字";
-        r["err_code"] = ok ? LAY_FONT_W : LAY_NO_CHARS;
+        r["error"] = !has ? "无有效汉字" : "第 " + std::to_string(bad_page) + " 页排版不可行（页内无字或字号超出视野）";
+        r["err_code"] = !has ? LAY_NO_CHARS : LAY_GRID;
     }
     json ev = op_event("task_preflight", nullptr);
-    ev["parameters"] = { { "text", utf8_text }, { "mode", r["mode"] }, { "orient", g_glyph_orient } };
-    ev["result"] = fits ? "ok" : "fail";
-    if (!fits) { ev["error_code"] = "layout"; ev["err_code"] = r.value("err_code", 0); }
+    ev["parameters"] = { { "text", utf8_text }, { "mode", r["mode"] }, { "orient", g_glyph_orient },
+                         { "page_chars", g_page_chars }, { "page_count", g_page_count } };
+    ev["result"] = (has && fits) ? "ok" : "fail";
+    if (!(has && fits)) { ev["error_code"] = "layout"; ev["err_code"] = r.value("err_code", 0); }
     audit_locked(ev);
     return r;
 }
 
-// ---------------- 自由拖拽排版（GUI 书写页） ----------------
+// ---------------- 自由拖拽排版 + 分页（GUI 书写页） ----------------
 // 固定视野：优先四角外接框（gs::trail），未标定（角不足 4）回退可达框 X±162/Y±85。
+
+// 过滤出全量有效字符序列：按行分组（\n/\r），行内仅保留汉字/标点，再按行顺序拼接。
+// 与旧 run_task_thread 的行过滤语义一致（不处理行间空段；光标等非有效字符被丢弃）。
+static std::wstring filter_page_chars(const std::wstring& wtext) {
+    std::wstring out;
+    std::vector<std::wstring> lines;
+    std::wstring cur;
+    for (wchar_t c : wtext) {
+        if (c == L'\n' || c == L'\r') { if (!cur.empty()) { lines.push_back(cur); cur.clear(); } }
+        else cur.push_back(c);
+    }
+    if (!cur.empty()) lines.push_back(cur);
+    for (auto& ln : lines)
+        for (wchar_t c : ln) if (isCJKOrPunct(c)) out.push_back(c);
+    return out;
+}
+
 void view_bounds(float& x0, float& y0, float& x1, float& y1) {
     float mnx, mny, mxx, mxy;
     if (trail::cornersBounds(mnx, mny, mxx, mxy) && trail::cornerCount() >= 4) {
@@ -757,26 +841,87 @@ static void rotate_local(float& x, float& y, float S, int orient) {
     }
 }
 
-// 供 run_task_thread：用自由布局构造 TextPlan（offsets 即每字左下角世界绝对坐标）。
-static bool prepare_free_layout(const std::wstring& wtext, TextPlan& plan, std::wstring& chars) {
-    chars.clear();
-    for (wchar_t c : wtext) if (isCJKOrPunct(c)) chars.push_back(c);
-    if (chars.empty()) return false;
-    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
-    if (g_free_text != chars || g_free_cells.size() != chars.size()) {
-        // 文本变了（或状态漂移）→ 重算初始网格；放不下不阻断书写路径的坐标，仅尽量夹取。
-        compute_initial_grid((int)chars.size(), g_free_char_size, g_free_cells);
-        g_free_text = chars;
+// 重新切页：full 为**全量**有效文本（不截断；超出容量的页 text 为空），按 g_page_chars 顺序
+// 切分成 g_page_count 页。同下标且文本一致的旧页保留其拖拽坐标（改页数/每页字数不丢摆位）。
+static void rebuild_pages(const std::wstring& full) {
+    std::vector<PageEntry> old;
+    old.swap(g_pages);
+    g_pages.clear();
+    int n = (int)full.size();
+    // 旧全文与各字所在旧页/页内下标（按首次出现位置建立映射，供字符级继承）
+    std::wstring old_all;
+    for (const auto& oe : old) old_all += oe.text;
+    auto inherit_cell = [&](wchar_t ch, int fallback_idx) -> Offset {
+        size_t p = old_all.find(ch);
+        if (p == std::wstring::npos) return Offset{ 1e30f, 1e30f };   // 找不到→哨兵，交补网格
+        // 定位该字在旧页中的坐标
+        size_t acc = 0;
+        for (const auto& oe : old) {
+            if (p < acc + oe.text.size()) {
+                size_t j = p - acc;
+                if (j < oe.cells.size()) return oe.cells[j];
+                break;
+            }
+            acc += oe.text.size();
+        }
+        (void)fallback_idx;
+        return Offset{ 1e30f, 1e30f };
+    };
+    int used = 0;
+    for (int k = 0; k < g_page_count; ++k) {
+        PageEntry e;
+        int take = std::max(0, std::min(g_page_chars, n - used));
+        e.text = take > 0 ? full.substr((size_t)used, (size_t)take) : std::wstring();
+        used += take;
+        // ①同下标同文本 → 整页沿用旧坐标
+        if (k < (int)old.size() && !e.text.empty()
+            && old[k].text == e.text && old[k].cells.size() == e.text.size()) {
+            e.cells = old[k].cells;
+        }
+        // ②文本变了（页数/每页字数/内容调整）→ 按字继承旧坐标；有任一字继承不到则整页重排，
+        //   保证同页坐标风格一致（不做半继承的怪布局）。
+        else if (!e.text.empty() && !old.empty()) {
+            std::vector<Offset> inh;
+            bool ok = true;
+            for (size_t i = 0; i < e.text.size() && ok; ++i) {
+                Offset c = inherit_cell(e.text[i], (int)i);
+                if (c.x > 1e29f) ok = false;
+                else inh.push_back(c);
+            }
+            if (ok && (int)inh.size() == (int)e.text.size()) e.cells = std::move(inh);
+        }
+        g_pages.push_back(std::move(e));
     }
+    // 所有有字页统一补初始网格：任意页切过去即可拖拽（set_free_cell 不再因 cells 未生成而失败）
+    for (auto& e : g_pages) ensure_page_grid(e, g_free_char_size);
+    if (g_edit_page >= (int)g_pages.size()) g_edit_page = g_pages.empty() ? 0 : (int)g_pages.size() - 1;
+    if (g_edit_page < 0) g_edit_page = 0;
+}
+
+// 页内缺字块坐标则按字号补初始网格（覆盖“文本变了”与“字号变了但 cells 仍在”两种情形）。
+static void ensure_page_grid(PageEntry& e, float S) {
+    if (e.text.empty()) { e.cells.clear(); return; }
+    if (e.cells.size() != e.text.size())
+        compute_initial_grid((int)e.text.size(), S, e.cells);
+}
+
+// 供 run_task_thread：按页生成 TextPlan（offsets 即该页每字左下角世界绝对坐标）。
+// cells 数量不符时兜底补初始网格（任务期间 GUI 被冻结，理论不可达，纯防御）。
+static bool prepare_page_plan(const PageEntry& e, TextPlan& plan) {
+    if (e.text.empty()) return false;
+    float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
+    std::vector<Offset> cells = e.cells;
+    if (cells.size() != e.text.size())
+        compute_initial_grid((int)e.text.size(), g_free_char_size, cells);
     plan = TextPlan();
     plan.ok = true;
     plan.used_S = g_free_char_size;
-    plan.cols = (int)chars.size(); plan.rows = 1;
+    plan.cols = (int)e.text.size(); plan.rows = 1;
     plan.dir = 0;
     plan.text_area = WorkArea{ 0.f, 0.f, 0.f, 0.f };   // 原点零：offsets 已是绝对世界坐标
     plan.offsets.clear();
-    for (size_t i = 0; i < chars.size(); ++i) {
-        float cx = g_free_cells[i].x, cy = g_free_cells[i].y;
+    for (size_t i = 0; i < e.text.size(); ++i) {
+        float cx = cells[i].x, cy = cells[i].y;
         clamp_cell(cx, cy, g_free_char_size, x0, y0, x1, y1);
         plan.offsets.push_back(Offset{ cx, cy });
     }
@@ -789,17 +934,21 @@ bool set_free_char_size(float mm) {
     if (mm < SINGLE_CHAR_MIN) mm = SINGLE_CHAR_MIN;   // 60mm 比赛红线
     if (mm > 500.f) mm = 500.f;
     g_free_char_size = mm;
-    compute_initial_grid((int)g_free_text.size(), g_free_char_size, g_free_cells);  // 复位摆位
+    // 分页场景：改字号**不再复位**已摆好的字块（避免毁掉多页手工布局），
+    // 只给缺坐标的页补初始网格；越界的旧坐标由渲染/书写路径夹取回视野。
+    for (auto& e : g_pages) ensure_page_grid(e, mm);
     cfg_save();
     return true;
 }
 bool set_free_cell(int idx, float x, float y) {
     if (g_task_active) return false;
-    if (idx < 0 || idx >= (int)g_free_cells.size()) return false;
+    if (idx < 0 || g_edit_page < 0 || g_edit_page >= (int)g_pages.size()) return false;
+    auto& e = g_pages[g_edit_page];
+    if (idx >= (int)e.cells.size()) return false;
     if (!std::isfinite(x) || !std::isfinite(y)) return false;
     float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
     clamp_cell(x, y, g_free_char_size, x0, y0, x1, y1);
-    g_free_cells[idx] = Offset{ x, y };
+    e.cells[idx] = Offset{ x, y };
     cfg_save();
     return true;
 }
@@ -811,53 +960,127 @@ bool set_glyph_orient(int o) {
     return true;
 }
 int  glyph_orient() { return g_glyph_orient; }
-void reset_canvas() { trail::reset(); }
+void reset_canvas() {
+    trail::reset();
+    g_task_finished = false;    // 重置画布 → 可编辑叠画重新出现
+}
 
-// 实时排版预览：不写审计、不改持久化，仅据当前文本与排版设置返回预检明细与叠画字块。
-// 供 GUI 书写页输入文字/调整字号布局时即时刷新（cells 为世界坐标 mm，绘制端自行缩放到画布）。
+// ---------------- 分页参数 / 页游标 ----------------
+bool set_page_chars(int n) {
+    if (g_task_active) return false;
+    if (n < 1 || n > 50) return false;
+    g_page_chars = n;
+    int cap = g_page_chars * g_page_count;
+    g_full_text = g_full_all.substr(0, std::min((size_t)cap, g_full_all.size()));
+    rebuild_pages(g_full_text);          // 文本不变的页保留坐标
+    cfg_save();
+    return true;
+}
+int page_chars() { return g_page_chars; }
+bool set_page_count(int n) {
+    if (g_task_active) return false;
+    if (n < 1 || n > 20) return false;
+    g_page_count = n;
+    int cap = g_page_chars * g_page_count;
+    g_full_text = g_full_all.substr(0, std::min((size_t)cap, g_full_all.size()));
+    rebuild_pages(g_full_text);
+    cfg_save();
+    return true;
+}
+int page_count() { return g_page_count; }
+bool set_edit_page(int idx0) {
+    if (g_task_active) return false;
+    if (idx0 < 0 || idx0 >= (int)g_pages.size()) return false;
+    g_edit_page = idx0;
+    return true;
+}
+int edit_page() { return g_edit_page; }
+int page_entry_count() { return (int)g_pages.size(); }
+bool page_entry(int idx0, PageEntry& out) {
+    if (idx0 < 0 || idx0 >= (int)g_pages.size()) return false;
+    out = g_pages[idx0];
+    return true;
+}
+void get_page_cells(int idx0, std::vector<Offset>& out) {
+    out.clear();
+    if (idx0 < 0 || idx0 >= (int)g_pages.size()) return;
+    out = g_pages[idx0].cells;
+}
+void text_capacity(int& total_chars, int& written_chars) {
+    int cap = g_page_chars * g_page_count;
+    total_chars  = (int)g_full_all.size();
+    written_chars = std::min(total_chars, cap);
+}
+int  display_page() { return g_task_active ? (int)g_write_page.load() : g_edit_page; }
+bool page_drag_enabled() {
+    return !g_task_active && display_page() == g_edit_page && trail::commandedSize() == 0;
+}
+
+// ---------------- 翻页预留接口（蓝牙未接入，默认模拟等待） ----------------
+void set_page_turn_handler(PageTurnFn fn) {
+    g_page_turn = fn ? std::move(fn) : PageTurnFn([](int, int) { return page_turn_wait_locked(); });
+}
+bool set_page_turn_wait_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 500 || ms > 60000) return false;
+    g_page_turn_wait_ms = ms;
+    cfg_save();
+    return true;
+}
+int page_turn_wait_ms() { return g_page_turn_wait_ms; }
+
+// 实时排版预览：不写审计；据当前文本重切页（文本未变的页保留拖拽坐标），
+// 返回【当前编辑页】的叠画字块与分页信息，供 GUI 书写页画布/翻页条即时刷新。
 json layout_preview(const std::string& utf8_text) {
     std::lock_guard<std::recursive_mutex> lk(g_mu);
-    std::wstring wtext = utf8_to_w(utf8_text);
-    std::wstring chars;
-    for (wchar_t c : wtext) if (isCJKOrPunct(c)) chars.push_back(c);
-    int n = (int)chars.size();
+    std::wstring all = filter_page_chars(utf8_to_w(utf8_text));
+    int cap = g_page_chars * g_page_count;
+    g_full_all  = all;
+    g_full_text = all.substr(0, std::min((size_t)cap, all.size()));
+    rebuild_pages(g_full_text);
+    int written = (int)g_full_text.size();
     float x0, y0, x1, y1; view_bounds(x0, y0, x1, y1);
     float S = g_free_char_size;
 
     json r;
-    r["mode"] = "free";
-    r["orient"] = g_glyph_orient;
-    r["char_count"] = n;
-    r["char_size"] = S;
-    r["view"] = json{ { "x0", x0 }, { "y0", y0 }, { "x1", x1 }, { "y1", y1 } };
+    r["mode"]        = "free";
+    r["orient"]      = g_glyph_orient;
+    r["page"]        = g_pages.empty() ? 0 : g_edit_page;
+    r["page_total"]  = (int)g_pages.size();
+    r["written_pages"] = (written + g_page_chars - 1) / g_page_chars;
+    r["page_chars"]  = g_page_chars;
+    r["text_total"]  = (int)all.size();
+    r["chars_planned"] = written;
+    r["char_size"]   = S;
+    r["truncated"]   = (int)all.size() > cap;
+    r["view"]        = json{ { "x0", x0 }, { "y0", y0 }, { "x1", x1 }, { "y1", y1 } };
     json cells = json::array();
 
-    if (n == 0) {
+    if (g_pages.empty() || g_edit_page >= (int)g_pages.size()) {
         r["valid"] = false;
+        r["partial"] = false;
         r["err_code"] = LAY_NO_CHARS;
+        r["char_count"] = 0;
         r["cells"] = cells;
         return r;
     }
-    // 文本变了 → 重算初始网格（复位拖拽）；否则复用已存坐标（拖拽/持久化结果）。
-    if (g_free_text != chars || g_free_cells.size() != (size_t)n) {
-        compute_initial_grid(n, S, g_free_cells);
-        g_free_text = chars;
-    }
-    // 可行性：按字号能否放进视野（放不下不自动缩放，仅置 valid=false 阻断开始书写）。
-    bool fits = grid_fits(n, S);
-    int m = (int)g_free_cells.size(); if (m > n) m = n;   // 防御：数量不符只画前 m 个
-    for (int i = 0; i < m; ++i) {
-        float cx = g_free_cells[i].x, cy = g_free_cells[i].y;
-        clamp_cell(cx, cy, S, x0, y0, x1, y1);
-        g_free_cells[i] = Offset{ cx, cy };
-        std::wstring one(1, chars[i]);
+    auto& e = g_pages[g_edit_page];
+    ensure_page_grid(e, S);                       // 本页缺坐标则补初始网格
+    // 坐标统一夹取回视野（字号变大等情形下保持与书写路径一致，所见即所得）。
+    for (auto& c : e.cells) clamp_cell(c.x, c.y, S, x0, y0, x1, y1);
+    r["char_count"] = (int)e.text.size();
+    // partial = 本页在“有字页”范围之外（容量外的空页，仅可浏览不可书写）；末页不满额不算。
+    r["partial"]    = (g_edit_page >= (written + g_page_chars - 1) / g_page_chars);
+    bool fits = grid_fits((int)e.text.size(), S);
+    for (size_t i = 0; i < e.text.size() && i < e.cells.size(); ++i) {
+        std::wstring one(1, e.text[i]);
         cells.push_back(json{
-            { "x", cx }, { "y", cy }, { "s", S },
-            { "idx", i }, { "ch", w_to_utf8(one) } });
+            { "x", e.cells[i].x }, { "y", e.cells[i].y }, { "s", S },
+            { "idx", (int)i }, { "ch", w_to_utf8(one) } });
     }
     r["cells"] = cells;
-    r["valid"] = fits;
-    r["err_code"] = fits ? LAY_OK : LAY_GRID;
+    r["valid"] = fits && !e.text.empty();
+    r["err_code"] = e.text.empty() ? LAY_NO_CHARS : (fits ? LAY_OK : LAY_GRID);
     return r;
 }
 
@@ -878,107 +1101,154 @@ static void run_task_thread(std::string text) {
         if (g_task_cancel) { end_task(false, "canceled", "estop"); return; }
     }
 
-    // 步骤 2：布局（行首字符按换行分组）
-    TextPlan plan; std::wstring chars;
-    std::wstring wtext = utf8_to_w(text);
-    std::vector<std::wstring> lines;
-    {
-        std::wstring cur;
-        for (wchar_t c : wtext) {
-            if (c == L'\n' || c == L'\r') { if (!cur.empty()) { lines.push_back(cur); cur.clear(); } }
-            else cur.push_back(c);
-        }
-        if (!cur.empty()) lines.push_back(cur);
-    }
-    if (lines.empty()) { end_task(false, "failed", "no_text"); return; }
+    // 步骤 2：分页布局。过滤→按容量截断（超出部分本次不写）→切页；每页独立字块（世界坐标重合）。
+    std::wstring all = filter_page_chars(utf8_to_w(text));
+    int cap = g_page_chars * g_page_count;
+    g_full_all  = all;
+    g_full_text = all.substr(0, std::min((size_t)cap, all.size()));
+    rebuild_pages(g_full_text);
+    const int written = (int)g_full_text.size();
+    if (written <= 0) { end_task(false, "failed", "no_chars"); return; }
+    task::begin(g_full_text, TextPlan(), "write");
+    const int   nPages = std::min((int)g_pages.size(), (written + g_page_chars - 1) / g_page_chars);
+    const float S = g_free_char_size;              // 全局字号（自由布局，各页共用）
+    const int   orient = g_glyph_orient;           // 字体朝向（整字旋转，仅改朝向不改位置）
+    int gci = 0;                                   // 跨页全局字序（蘸墨“每 5 字”节奏依据）
 
-    std::wstring all_chars;
-    std::vector<int> line_begin, line_len;
-    for (auto& ln : lines) {
-        std::wstring cs;
-        for (wchar_t c : ln) if (isCJKOrPunct(c)) cs.push_back(c);
-        if (cs.empty()) continue;
-        line_begin.push_back((int)all_chars.size());
-        line_len.push_back((int)cs.size());
-        all_chars += cs;
-    }
-    if (all_chars.empty()) { end_task(false, "failed", "no_chars"); return; }
-    if (!prepare_free_layout(all_chars, plan, chars)) { end_task(false, "failed", "layout"); return; }
-    task::begin(chars, plan, "write");
-    const float S = plan.used_S;              // 全局字号（自由布局）
-    const int   orient = g_glyph_orient;      // 字体朝向（整字旋转，仅改朝向不改位置）
+    // 步骤 3：逐页 → 逐字流式书写
+    for (int pi = 0; pi < nPages; ++pi) {
+        PageEntry e;
+        if (!page_entry(pi, e) || e.text.empty()) { end_task(false, "failed", "layout"); return; }
+        TextPlan plan;
+        if (!prepare_page_plan(e, plan)) { end_task(false, "failed", "layout"); return; }
+        const std::wstring& chars = e.text;        // 本页字符序列
+        g_write_page = pi;                         // GUI 画布/翻页条跟随显示当前书写页
+        task::page_begin(pi, nPages, (int)chars.size());
 
-    // 步骤 3：逐字流式书写（每字发送后更新进度）
-    for (size_t ci = 0; ci < chars.size(); ++ci) {
-        if (g_task_cancel) { end_task(false, "canceled", "estop"); return; }
-
-        MMAHCharData ch;
-        if (!loadCharData(chars[ci], ch)) {
-            wprintln(L"[警告] 找不到字形数据，跳过：" + std::wstring(1, chars[ci]));
-            task::char_done((int)ci);
-            continue;
-        }
-        std::vector<Point> local;
-        if (!generateSingleCharTrajectory(ch, SPEED_LEVEL, local, S)) continue;
-
-        // 把字形局部外接框居中到 S×S 字格：generateSingleCharTrajectory 按最长边缩放到 S 并以
-        // bbox 左下角对齐 (0,0)，扁字（一/二/三）会贴到字格底部 → 与“居中”的预览框不一致、实写偏下。
-        // 这里补一个居中偏移，使实际落笔与拖拽字格所见即所得（填满格的字 dx/dy≈0，无影响）。
-        float minlx = 1e30f, maxlx = -1e30f, minly = 1e30f, maxly = -1e30f;
-        for (const auto& p : local) {
-            minlx = std::min(minlx, p.x); maxlx = std::max(maxlx, p.x);
-            minly = std::min(minly, p.y); maxly = std::max(maxly, p.y);
-        }
-        if (!(maxlx >= minlx && maxly >= minly)) { minlx = maxlx = minly = maxly = 0.f; }
-        const float dcx = S / 2 - (minlx + maxlx) / 2;
-        const float dcy = S / 2 - (minly + maxly) / 2;
-
-        std::vector<Point> one; one.reserve(local.size() + 2);
-        const Offset& of = plan.offsets[(int)ci];   // 该字左下角世界绝对坐标
-        for (const auto& p : local) {
-            float lx = p.x + dcx, ly = p.y + dcy;   // 先居中到字格 [0,S]×[0,S]
-            rotate_local(lx, ly, S, orient);        // 再按朝向绕字心旋转
-            one.push_back(Point{ of.x + lx, of.y + ly,
-                                 p.z, p.isPenDown, p.speed, p.zType });
-        }
-        task::traj_add_total(one.size());
-
-        bool firstOfLine = false;
-        for (size_t k = 0; k < line_begin.size(); ++k)
-            if (line_begin[k] == (int)ci) { firstOfLine = true; break; }
-
-        if ((ci == 0) || firstOfLine) {
-            Point firstUp = one.front();
-            firstUp.z = Z_UP;
-            firstUp.isPenDown = false;
-            firstUp.zType = (ci == 0) ? "UP-FIRST-ANCHOR" : "UP-LINE-ANCHOR";
-            if (!move_up_to_and_wait(g_port, firstUp, true)) { end_task(false, "failed", "prepos"); return; }
-            std::this_thread::sleep_for(std::chrono::milliseconds(g_enableDip ? 400 : 200));
-        }
-
-        task::stage("书写");
-        if (!transmitTrajectoryWithSplit(g_port, one, one.size())) {
+        for (size_t ci = 0; ci < chars.size(); ++ci) {
             if (g_task_cancel) { end_task(false, "canceled", "estop"); return; }
-            end_task(false, "failed", "send");
-            return;
-        }
-        task::char_done((int)ci);
 
-        // ★实时轨迹：真机每字采一次 0x03 实测坐标（任务线程独占串口，readPose 安全穿插）
-        if (!g_dryRun && g_port.is_open()) {
-            float ax = 0, ay = 0, az = 0;
-            if (g_port.readPose(ax, ay, az)) trail::addActual(ax, ay);
-        }
+            MMAHCharData ch;
+            if (!loadCharData(chars[ci], ch)) {
+                wprintln(L"[警告] 找不到字形数据，跳过：" + std::wstring(1, chars[ci]));
+                task::char_done((int)ci);
+                ++gci;
+                continue;
+            }
+            std::vector<Point> local;
+            if (!generateSingleCharTrajectory(ch, SPEED_LEVEL, local, S)) {
+                Point up = Point{ plan.offsets[(int)ci].x, plan.offsets[(int)ci].y, Z_UP, false,
+                                  (uint8_t)SPEED_LEVEL, "UP-BADGLYPH" };
+                g_port.sendPointRetry(up);
+                end_task(false, "failed", "glyph");
+                return;
+            }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(g_highQuality ? 160 : 120));
+            // 把字形局部外接框居中到 S×S 字格：generateSingleCharTrajectory 按最长边缩放到 S 并以
+            // bbox 左下角对齐 (0,0)，扁字（一/二/三）会贴到字格底部 → 与“居中”的预览框不一致、实写偏下。
+            // 这里补一个居中偏移，使实际落笔与拖拽字格所见即所得（填满格的字 dx/dy≈0，无影响）。
+            float minlx = 1e30f, maxlx = -1e30f, minly = 1e30f, maxly = -1e30f;
+            for (const auto& p : local) {
+                minlx = std::min(minlx, p.x); maxlx = std::max(maxlx, p.x);
+                minly = std::min(minly, p.y); maxly = std::max(maxly, p.y);
+            }
+            if (!(maxlx >= minlx && maxly >= minly)) { minlx = maxlx = minly = maxly = 0.f; }
+            const float dcx = S / 2 - (minlx + maxlx) / 2;
+            const float dcy = S / 2 - (minly + maxly) / 2;
 
-        if (g_enableDip && ((int)(ci + 1) % 5 == 0) && ci + 1 < chars.size()) {
+            std::vector<Point> one; one.reserve(local.size() + 2);
+            const Offset& of = plan.offsets[(int)ci];   // 该字左下角世界绝对坐标（本页）
+            for (const auto& p : local) {
+                float lx = p.x + dcx, ly = p.y + dcy;   // 先居中到字格 [0,S]×[0,S]
+                rotate_local(lx, ly, S, orient);        // 再按朝向绕字心旋转
+                one.push_back(Point{ of.x + lx, of.y + ly,
+                                     p.z, p.isPenDown, p.speed, p.zType });
+            }
+            task::traj_add_total(one.size());
+
+            // 每页首字：先抬笔预定位到该字起点上方（页与页之间同样需要，翻页后从纸上空白区起步）
+            if (ci == 0) {
+                Point firstUp = one.front();
+                firstUp.z = Z_UP;
+                firstUp.isPenDown = false;
+                firstUp.zType = "UP-FIRST-ANCHOR";
+                if (!move_up_to_and_wait(g_port, firstUp, true)) { end_task(false, "failed", "prepos"); return; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(g_enableDip ? 400 : 200));
+            }
+
+            task::stage("书写");
+            if (!transmitTrajectoryWithSplit(g_port, one, one.size())) {
+                if (g_task_cancel) { end_task(false, "canceled", "estop"); return; }
+                end_task(false, "failed", "send");
+                return;
+            }
+            task::char_done((int)ci);
+            ++gci;
+
+            // ★实时轨迹：真机每字采一次 0x03 实测坐标（任务线程独占串口，readPose 安全穿插）
+            if (!g_dryRun && g_port.is_open()) {
+                float ax = 0, ay = 0, az = 0;
+                if (g_port.readPose(ax, ay, az)) trail::addActual(ax, ay);
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(g_highQuality ? 160 : 120));
+
+            // 跨页全局“每 5 字”蘸墨（gci 为已写字数；本页已无后续字时留给页尾补蘸）
+            if (g_enableDip && gci % 5 == 0 && gci < written) {
+                task::stage("蘸墨");
+                if (!do_dip_and_groom(g_port, g_ink)) { end_task(false, "failed", "dip"); return; }
+            }
+        }   // ← 本页逐字循环结束
+
+        // 页尾补蘸：全局计数不满 5 的倍数且后面还有页要写（保持原“书写结束前至少一次蘸墨”语义）
+        if (g_enableDip && gci % 5 != 0 && pi + 1 < nPages) {
             task::stage("蘸墨");
             if (!do_dip_and_groom(g_port, g_ink)) { end_task(false, "failed", "dip"); return; }
         }
-    }
 
-    if (g_enableDip && ((int)chars.size() % 5 != 0)) {
+        // —— 翻页（仅非末页）：抬笔 → 通知 GUI 切页 → 蓝牙信号(当前为模拟等待) → 清轨迹 —— //
+        if (pi + 1 < nPages) {
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_mu);
+                // 抬笔到当页末字正上方，避免拖纸时笔尖蹭纸
+                const Offset& lastOfs = plan.offsets.back();
+                Point up = Point{ lastOfs.x + S / 2, lastOfs.y + S / 2, Z_UP, false,
+                                  (uint8_t)SPEED_LEVEL, "UP-PAGETURN" };
+                if (g_port.sendPointRetry(up)) task::traj_add_done(1, false);
+                session_id();
+                json ev = op_event("page_turn", nullptr);
+                ev["parameters"] = { { "turn_to_page", pi + 2 }, { "page_total", nPages },
+                                     { "wait_ms", g_page_turn_wait_ms } };
+                ev["turn_to_page"] = pi + 2;
+                audit_locked(ev);
+                task::stage("翻页");
+            }
+            const bool turnOk = g_page_turn ? g_page_turn(pi + 2, nPages) : page_turn_wait_locked();
+            std::string turnErr;
+            if (turnOk) {
+                g_write_page = pi + 1;             // 翻页成功：GUI 画布切到下一页
+                trail::reset();                    // 实时轨迹只展示当前页 → 换页后从空白重播
+            }
+            else {
+                turnErr = (g_task_cancel || g_estop) ? "canceled" : "turn_failed";
+            }
+            {
+                std::lock_guard<std::recursive_mutex> lk(g_mu);
+                json ev = op_event("page_turn_result", nullptr);
+                ev["parameters"] = { { "turn_to_page", pi + 2 }, { "page_total", nPages } };
+                ev["result"] = turnOk ? "ok" : turnErr;
+                audit_locked(ev);
+            }
+            if (!turnOk) {
+                if (g_task_cancel || g_estop) { end_task(false, "canceled", "estop"); return; }
+                end_task(false, "failed", "page_turn");
+                return;
+            }
+        }
+    }   // ← 页循环结束
+
+    // 末页收尾蘸墨（全局计数不满 5 的倍数；与旧行为一致）
+    if (g_enableDip && written % 5 != 0) {
         task::stage("蘸墨");
         if (!do_dip_and_groom(g_port, g_ink)) { end_task(false, "failed", "dip"); return; }
     }
@@ -1025,9 +1295,12 @@ bool start_write(const std::string& utf8_text, std::string& err) {
         ev["parameters"] = { { "text", utf8_text } };
         audit_locked(ev);
         g_task_active = true;
+        g_write_page = 0;                 // 任务固定从第 1 页开始
+        g_task_finished = false;
         trail::reset();                 // ★新任务开始：清空上一任务的实时轨迹
         g_task_thread = std::thread([text = utf8_text]() {
             run_task_thread(text);
+            g_task_finished = true;       // 先立“已结束”标志，再清 active，避免 GUI 空窗误恢复编辑
             g_task_active = false;
         });
         g_task_thread.detach();
@@ -1129,14 +1402,22 @@ bool cfg_save() {
     j["layout_top_ratio"]      = g_lm_top_ratio;
     j["layout_row_spacing"]    = g_lm_row_spacing;
     j["write_dir"]             = g_write_dir;
-    // —— 自由拖拽排版（按文本绑定）—— //
-    j["free_text"]             = w_to_utf8(g_free_text);
+    // —— 自由拖拽排版 + 分页（每页一份字块坐标；世界坐标系各页重合）—— //
     j["free_char_size"]        = g_free_char_size;
     j["glyph_orient"]          = g_glyph_orient;
+    j["page_chars"]            = g_page_chars;
+    j["page_count"]            = g_page_count;
+    j["page_turn_wait_ms"]     = g_page_turn_wait_ms;
+    j["page_text"]             = w_to_utf8(g_full_text);    // 实际书写子串（截断后）
+    j["page_text_full"]        = w_to_utf8(g_full_all);     // 全量文本（容量恢复后不丢字）
     {
-        json fc = json::array();
-        for (const auto& c : g_free_cells) fc.push_back(json{ { "x", c.x }, { "y", c.y } });
-        j["free_cells"] = fc;
+        json pages = json::array();
+        for (const auto& e : g_pages) {
+            json cells = json::array();
+            for (const auto& c : e.cells) cells.push_back(json{ { "x", c.x }, { "y", c.y } });
+            pages.push_back(json{ { "text", w_to_utf8(e.text) }, { "cells", cells } });
+        }
+        j["page_cells"] = pages;
     }
     j["corners"]      = trail::calibToJson();     // ★实时轨迹：四角标定持久化（下次开 GUI 沿用）
     std::ofstream ofs("robot_config.json");
@@ -1215,7 +1496,7 @@ void cfg_load() {
             int d = j["write_dir"].get<int>();
             if (d == 0 || d == 1) g_write_dir = d;
         }
-        // —— 自由拖拽排版（按文本绑定）—— //
+        // —— 自由拖拽排版 + 分页 —— //
         if (j.contains("free_char_size") && j["free_char_size"].is_number()) {
             float v = j["free_char_size"].get<float>();
             if (std::isfinite(v) && v >= SINGLE_CHAR_MIN && v <= 500.0f) g_free_char_size = v;
@@ -1224,17 +1505,77 @@ void cfg_load() {
             int o = j["glyph_orient"].get<int>();
             if (o >= 0 && o <= 3) g_glyph_orient = o;
         }
-        if (j.contains("free_text") && j["free_text"].is_string())
-            g_free_text = utf8_to_w(j["free_text"].get<std::string>());
-        if (j.contains("free_cells") && j["free_cells"].is_array()) {
-            g_free_cells.clear();
-            for (auto& e : j["free_cells"]) {
-                if (!e.is_object()) continue;
-                float x = e.value("x", 0.0f), y = e.value("y", 0.0f);
-                if (std::isfinite(x) && std::isfinite(y)) g_free_cells.push_back(Offset{ x, y });
+        if (j.contains("page_chars") && j["page_chars"].is_number_integer()) {
+            int v = j["page_chars"].get<int>();
+            if (v >= 1 && v <= 50) g_page_chars = v;
+        }
+        if (j.contains("page_count") && j["page_count"].is_number_integer()) {
+            int v = j["page_count"].get<int>();
+            if (v >= 1 && v <= 20) g_page_count = v;
+        }
+        if (j.contains("page_turn_wait_ms") && j["page_turn_wait_ms"].is_number_integer()) {
+            int v = j["page_turn_wait_ms"].get<int>();
+            if (v >= 500 && v <= 60000) g_page_turn_wait_ms = v;
+        }
+        {
+            auto parseCells = [](const json& arr) {
+                std::vector<Offset> cells;
+                if (!arr.is_array()) return cells;
+                for (auto& e : arr) {
+                    if (!e.is_object()) continue;
+                    float x = e.value("x", 0.0f), y = e.value("y", 0.0f);
+                    if (std::isfinite(x) && std::isfinite(y)) cells.push_back(Offset{ x, y });
+                }
+                return cells;
+            };
+            bool loaded = false;
+            if (j.contains("page_cells") && j["page_cells"].is_array()) {
+                std::vector<PageEntry> pages;
+                bool bad = false;
+                for (auto& ep : j["page_cells"]) {
+                    if (!ep.is_object() || !ep.contains("text") || !ep["text"].is_string()) { bad = true; break; }
+                    PageEntry e;
+                    e.text = utf8_to_w(ep["text"].get<std::string>());
+                    e.cells = parseCells(ep.value("cells", json::array()));
+                    if (e.cells.size() != e.text.size()) { bad = true; break; }   // 数据漂移→整组弃用重排
+                    pages.push_back(std::move(e));
+                }
+                if (!bad) {
+                    g_pages = std::move(pages);
+                    // 实际书写文本 = 各页文本拼接（page_text 仅作空页情形的兜底，绝不相加以防双份）
+                    g_full_text.clear();
+                    for (const auto& e : g_pages) g_full_text += e.text;
+                    if (g_full_text.empty() && j.contains("page_text") && j["page_text"].is_string())
+                        g_full_text = utf8_to_w(j["page_text"].get<std::string>());
+                    g_full_all = j.contains("page_text_full") && j["page_text_full"].is_string()
+                               ? utf8_to_w(j["page_text_full"].get<std::string>())
+                               : g_full_text;
+                    if (g_full_all.size() < g_full_text.size()) g_full_all = g_full_text;
+                    loaded = true;
+                }
             }
-            // 数量与文本不符则丢弃坐标，交由 layout_preview 重算初始网格。
-            if (g_free_cells.size() != g_free_text.size()) g_free_cells.clear();
+            // 旧版单页键迁移：free_text/free_cells → 第 1 页（不丢用户既有摆位）
+            if (!loaded && j.contains("free_text") && j["free_text"].is_string()) {
+                std::wstring ft = utf8_to_w(j["free_text"].get<std::string>());
+                std::vector<Offset> fc = parseCells(j.value("free_cells", json::array()));
+                if (!ft.empty() && fc.size() == ft.size()) {
+                    g_pages.clear();
+                    g_pages.push_back(PageEntry{ ft, fc });
+                    g_full_text = ft;
+                    g_full_all  = ft;
+                    if (g_page_count < 1) g_page_count = 1;
+                }
+                loaded = true;   // 旧键存在即视为已处理，不再走空态
+            }
+            if (!loaded) { g_pages.clear(); g_full_text.clear(); g_full_all.clear(); }
+            // 按当前容量重新截断并切页（文本一致的页保留坐标）
+            {
+                int cap0 = g_page_chars * g_page_count;
+                g_full_text = g_full_all.substr(0, std::min((size_t)cap0, g_full_all.size()));
+                if (!g_full_text.empty()) rebuild_pages(g_full_text);
+                else g_pages.clear();
+            }
+            if (g_edit_page >= (int)g_pages.size()) g_edit_page = 0;
         }
         if (j.contains("ink") && j["ink"].is_array() && j["ink"].size() == 4) {
             g_ink = InkStation{ j["ink"][0].get<float>(), j["ink"][1].get<float>(),
@@ -1316,7 +1657,7 @@ void set_window_size(int w, int h) {
 void shutdown() {
     if (g_task_active) abort_task();
     int wait = 0;
-    while (g_task_active && wait < 3000) {
+    while (g_task_active && wait < 6000) {   // 翻页模拟等待可达数秒，放宽收尾上限
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         wait += 50;
     }

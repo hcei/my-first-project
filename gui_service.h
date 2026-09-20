@@ -18,6 +18,7 @@
 #include "nlohmann/json.hpp"
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace gs {
 
@@ -49,7 +50,8 @@ json last_comm();
 // ---------------- 任务进度钩子（motion.cpp 调用；仅内存计数，不打印） ----------------
 namespace task {
 void begin(const std::wstring& chars, const TextPlan& plan, const char* kind);
-void stage(const char* label);      // 预热/蘸墨/书写/描边/空闲
+void page_begin(int page_idx0, int page_total, int chars_in_page);  // 分页任务：每页开始，页内字符/轨迹计数复位
+void stage(const char* label);      // 预热/蘸墨/书写/翻页/描边/空闲
 void char_done(int idx);
 void traj_add_total(size_t n);
 void traj_add_done(size_t n, bool pen_down);
@@ -99,16 +101,42 @@ bool set_layout_row_spacing(float mm);     // 行间距 mm
 bool set_write_dir(int dir);               // 书写方向 0=横排左起, 1=竖排右起
 json layout_preview(const std::string& utf8_text);  // 实时预检明细 + 叠画计划字块（世界坐标）
 
-// —— 自由拖拽排版（GUI 书写页 2026-09-19 重构）—— //
+// —— 自由拖拽排版（GUI 书写页 2026-09-19 重构；2026-09-20 升级为分页）—— //
 // 网格仅作“初始摆位”，用户可在固定视野（四角标定框，未标定回退可达 X±162/Y±85）内
-// 逐字拖拽定位；拖拽结果按文本绑定持久化，书写时所见即所得。
+// 逐字拖拽定位；拖拽结果按“每页一份”持久化，书写时所见即所得。
 // 视野矩形（世界 mm，x0<x1、y0<y1）：优先四角外接框，否则可达回退框。
+// 分页模型：有效文本 = 输入前 min(总字数, 每页字数×总页数) 字（超出截断不参与书写），
+// 按每页字数顺序切页；每页拥有独立字块坐标（同一世界坐标系，翻页走纸量=版面高、坐标重合）。
+struct PageEntry {
+    std::wstring          text;    // 该页有效汉字序列
+    std::vector<Offset>   cells;   // 每字左下角世界坐标，size 与 text 一致
+};
 void view_bounds(float& x0, float& y0, float& x1, float& y1);
-bool set_free_char_size(float mm);         // 设定全局字号（≥60）→ 重算初始网格摆位（复位拖拽）
-bool set_free_cell(int idx, float x, float y);  // 拖拽更新第 idx 字左下角世界坐标（夹取在视野内）
+bool set_free_char_size(float mm);         // 设定全局字号（≥60）；仅给缺坐标的页补初始网格
+bool set_free_cell(int idx, float x, float y);  // 拖拽更新【当前编辑页】第 idx 字左下角（夹取在视野内）
 bool set_glyph_orient(int o);              // 字体朝向 0=沿y向下(0°)/1=沿y向上(180°)/2=沿x向上(90°CW)/3=沿x向下(90°CCW)
 int  glyph_orient();                       // 读取当前字体朝向
 void reset_canvas();                       // 清空实时轨迹缓冲，使可编辑字块叠画重新出现
+// —— 分页参数与页游标 —— //
+bool set_page_chars(int n);                // 每页字数 1~50 → 重新切页（文本未变的页保留拖拽坐标）
+int  page_chars();
+bool set_page_count(int n);                // 总页数 1~20 → 重新切页
+int  page_count();
+bool set_edit_page(int idx0);              // 切换编辑页（任务运行中拒绝）
+int  edit_page();
+int  page_entry_count();                   // 当前分页结果页数（== page_count，无文本时为 0）
+bool page_entry(int idx0, PageEntry& out); // 取某页文本+字块（世界坐标）
+void get_page_cells(int idx0, std::vector<Offset>& out);
+void text_capacity(int& total_chars, int& written_chars);  // 过滤后总字数 / 截断后实际书写字数
+int  display_page();                       // 任务中=书写页；空闲=编辑页（GUI 画布/翻页条显示依据）
+bool page_drag_enabled();                  // 空闲 + 显示页==编辑页 + 无历史轨迹 → 允许拖拽
+// —— 翻页预留接口（蓝牙模块暂不接入）—— //
+// 每写完一页：抬笔 → 调用该回调（入参=即将书写的页码 1-based 与总页数，返回 false=翻页失败）
+// → 清空实时轨迹 → 写下一页。默认实现为模拟：等待 page_turn_wait_ms 后返回成功。
+using PageTurnFn = std::function<bool(int page_no_1based, int page_total)>;
+void set_page_turn_handler(PageTurnFn fn); // 注入真实蓝牙翻页实现（传 nullptr 恢复默认模拟）
+bool set_page_turn_wait_ms(int ms);        // 模拟等待时长 500~60000ms，持久化
+int  page_turn_wait_ms();
 bool preview_writing_plane(float z, std::string& err);  // 移到 (0,0,z) 悬停，确认书写高度（不书写）
 bool set_writing_plane(float z, std::string& err);      // 保存书写平面 Z：生效 + 持久化（后续书写统一用该 Z）
 // —— 四角标定（实时轨迹面板）：预览=抬笔移到该角(真机移动)；保存=固定并持久化；清除=复位 —— //

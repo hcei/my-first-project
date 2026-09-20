@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <cwctype>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -62,7 +63,7 @@ static const int INFO_ROW_MAX = 44;    // 设备信息行距上限（多余高�
 static const int INFO_LABEL_W = 88;    // 设备信息标签列宽（容纳 4 字标签）
 static const int INFO_VALUE_DX = 94;   // 设备信息值列相对标签起点的偏移
 static const int CONNECT_PANEL_H = 246;// 连接页面板高度
-static const int WRITE_PANEL_H = 300;  // 书写页面板高度（仅字号+朝向+操作+状态，画布更大便于拖拽）
+static const int WRITE_PANEL_H = 346;  // 书写页面板高度（字号+朝向+分页+操作+状态，画布更大便于拖拽）
 static const int PLANE_PANEL_H = 280;  // 书写平面页面板高度
 static const int BTN_H = 40, BTN_PITCH = 52;
 static const int CHK_H = 24, CHK_PITCH = 30;
@@ -194,6 +195,7 @@ enum {
     IDC_CHECK_MANUAL, IDC_EDIT_LAY_CS, IDC_EDIT_LAY_COLS, IDC_EDIT_LAY_TOPR, IDC_EDIT_LAY_ROWSP,
     IDC_BTN_LAY_APPLY, IDC_BTN_LAY_AUTO, IDC_CHECK_VERT,
     IDC_COMBO_ORIENT, IDC_BTN_RESETCANVAS,
+    IDC_EDIT_PAGECH, IDC_EDIT_PGCNT, IDC_EDIT_TURNWAIT, IDC_BTN_PAGE_PREV, IDC_BTN_PAGE_NEXT,
     ID_PAGE_HOME = 2001, ID_PAGE_CONNECT, ID_PAGE_WRITE, ID_PAGE_PLANE,
     IDT_TIMER = 3001,
 };
@@ -227,6 +229,13 @@ static HWND g_cornerEdits[8] = {};      // 四角标定输入：[i*2]=角i X，[
 // —— 自由拖拽排版（书写页）—— //
 static HWND g_editCharSize = nullptr;   // 字号 mm 输入框（唯一保留的排版数值控件）
 static HWND g_comboOrient  = nullptr;   // 书写方向（字体朝向）下拉：4 个朝向
+static HWND g_editPageCh   = nullptr;   // 每页字数输入框
+static HWND g_editPgCnt    = nullptr;   // 总页数输入框
+static HWND g_editTurnWait = nullptr;   // 翻页模拟等待 ms 输入框（轨迹面板翻页条内）
+static HWND g_stcTrunc     = nullptr;   // 截断提示文本（超容量时显示）
+// 分页缓存（UI 线程；RefreshLayoutPreview 更新）：编辑页/总页数/本次要写页数/页内是否有字
+static int  g_pgEdit = 0, g_pgTotal = 0, g_pgWritten = 0;
+static bool g_pgPartial = true;         // 当前编辑页无字（容量外页）
 struct PrevCell { float x{ 0 }, y{ 0 }, s{ 0 }; std::wstring ch; };  // 计划字块（世界坐标 mm，x/y 为左下角）
 static std::vector<PrevCell> g_prevCells;
 static bool g_prevValid = false;        // 预览有效（非任务中且字号塞得进视野）
@@ -515,6 +524,10 @@ struct WritePlot {
     int grpX[4], grpY[4];       // 每个角组左上原点（2×2 网格）
     int lblW, edW, btnW, rowH;  // 组内元素尺寸（绘制与控件共用）
     int clearX, clearY, clearW, clearH;
+    RECT strip;                 // 翻页条整行（含页签/等待输入）
+    RECT btnPrev, btnNext;      // ◀ ▶ 按钮
+    int pgLabX, pgLabW;         // “第 k/N 页”文本区
+    int waitLabX, waitLabW, waitEdX, waitEdW;   // 翻页等待标签 + 输入框
     RECT plot;                  // 绘图区
 };
 
@@ -547,7 +560,14 @@ static WritePlot WritePlotGeo(const RECT& rc) {
     p.lblW = 46; p.edW = 52; p.btnW = 52; p.rowH = 26;
     int groupW = p.lblW + 4 + p.edW + 4 + p.edW + 4 + p.btnW + 3 + p.btnW;   // 与 CornerGroupRects 对齐
     int colSpan = groupW + 20, rowSpan = p.rowH + 10;
-    p.ctrlTop = p.y + 40;
+    // 翻页条（标题下方一行）：◀ 第 k/N 页（本次写 M 页）▶ …… 翻页等待(ms) [输入]
+    p.strip = RECT{ p.x + pad, p.y + 40, p.x + p.w - pad, p.y + 70 };
+    p.btnPrev = RECT{ p.strip.left, p.strip.top + 2, p.strip.left + 30, p.strip.top + 26 };
+    p.pgLabX = p.btnPrev.right + 8; p.pgLabW = 480;
+    p.btnNext = RECT{ p.pgLabX + p.pgLabW + 8, p.strip.top + 2, p.pgLabX + p.pgLabW + 38, p.strip.top + 26 };
+    p.waitLabX = p.btnNext.right + 24; p.waitLabW = 150;
+    p.waitEdX = p.waitLabX + p.waitLabW; p.waitEdW = 64;
+    p.ctrlTop = p.strip.bottom + 6;
     for (int i = 0; i < 4; ++i) {
         int col = i % 2, row = i / 2;
         p.grpX[i] = p.x + pad + col * colSpan;
@@ -571,6 +591,9 @@ struct WriteLayoutGeo {
     int csLabW, csEdX, csEdW;               // “字号 mm”标签宽 + 输入框
     int orLabX, orLabW, orComboX, orComboW; // “书写方向”标签 + 下拉
     int resetX, resetW, resetH;             // “重置画布”按钮
+    int row3Y;                              // 每页字数 / 总页数 行
+    int pcLabW, pcEdX, pcEdW;               // “每页字数”标签 + 输入框
+    int pnLabX, pnLabW, pnEdX, pnEdW;       // “总页数”标签 + 输入框
     int actionY;                            // 预检 / 开始 / 停止 行
     int statusY, statusH;                   // 只读状态框
 };
@@ -578,14 +601,18 @@ static WriteLayoutGeo WLGeo(const RECT& rc) {
     TwoColGeo g = TwoColLayout(rc, WRITE_PANEL_H);
     WriteLayoutGeo L{};
     L.innerX = g.innerX; L.innerW = g.innerW;
-    L.textY = g.top + 46; L.textH = 64;
-    L.row2Y = g.top + 120;
+    L.textY = g.top + 46; L.textH = 58;
+    L.row2Y = g.top + 114;
     L.csLabW = 60; L.csEdW = 64; L.csEdX = g.innerX + L.csLabW;
     L.orLabX = L.csEdX + L.csEdW + 18; L.orLabW = 72;
     L.orComboX = L.orLabX + L.orLabW; L.orComboW = 168;
     L.resetH = 28; L.resetW = 84; L.resetX = g.innerX + g.innerW - L.resetW;
-    L.actionY = g.top + 158;
-    L.statusY = g.top + 208;
+    L.row3Y = g.top + 150;
+    L.pcLabW = 84; L.pcEdW = 44; L.pcEdX = g.innerX + L.pcLabW;
+    L.pnLabX = L.pcEdX + L.pcEdW + 24; L.pnLabW = 60;
+    L.pnEdX = L.pnLabX + L.pnLabW; L.pnEdW = 44;
+    L.actionY = g.top + 190;
+    L.statusY = g.top + 244;
     L.statusH = (g.top + g.panelH - PANEL_PAD) - L.statusY; if (L.statusH < 40) L.statusH = 40;
     return L;
 }
@@ -635,6 +662,23 @@ static void DrawTrailPanel(HDC dc, const WritePlot& p) {
     if (!g_st.lastResult.empty())
         Text(dc, g_st.lastResult, p.x + 320, p.y + 6, p.w - 320 - PANEL_PAD, 30,
              g_st.resultIsErr ? DANGER : PURPLE_DARK, 15, true, DT_RIGHT);
+    // 翻页条：任务中显示书写页（只读跟随），空闲显示编辑页；括号内为本次实际要写的页数
+    {
+        bool act = snapB("task", "active");
+        std::wstring pg;
+        if (act)
+            pg = fmt(L"书写第 %d/%d 页（共 %d 页）", snapI("task", "page_no", 1),
+                     snapI("task", "page_total", 1), g_pgWritten);
+        else if (g_pgTotal > 0)
+            pg = fmt(L"第 %d/%d 页　（%s　本次书写 %d/%d 页）", g_pgEdit + 1, g_pgTotal,
+                     g_pgPartial ? L"本页无字·容量外" : L"本页有字",
+                     std::min(g_pgWritten, g_pgTotal), g_pgWritten);
+        else
+            pg = L"输入文字后分页";
+        Text(dc, pg, p.pgLabX, p.strip.top, p.pgLabW, 26, g_pgPartial && !act ? WARN : INK, 16, true);
+        Text(dc, L"翻页等待(ms)：", p.waitLabX, p.strip.top, p.waitLabW, 26, MUTED, 14, true);
+        // ◀ ▶ 为 owner-draw 按钮子窗口（CreateWriteControls），此处不画
+    }
     for (int i = 0; i < 4; ++i) {
         RECT lb; CornerGroupRects(p, i, &lb, nullptr, nullptr, nullptr, nullptr);
         Text(dc, CORNER_TITLE[i], lb.left, lb.top, lb.right - lb.left, lb.bottom - lb.top, INK, 15, true);
@@ -814,6 +858,8 @@ static void DrawWrite(HDC dc, RECT& rc) {
     WriteLayoutGeo L = WLGeo(rc);
     Text(dc, L"字号 mm", L.innerX, L.row2Y + 3, L.csLabW, 22, INK, 14, true);
     Text(dc, L"书写方向", L.orLabX, L.row2Y + 3, L.orLabW, 22, INK, 14, true);
+    Text(dc, L"每页字数", L.innerX, L.row3Y + 3, L.pcLabW, 22, INK, 14, true);
+    Text(dc, L"总页数", L.pnLabX, L.row3Y + 3, L.pnLabW, 22, INK, 14, true);
 
     Panel(dc, g.rightX, g.top, g.colW, g.panelH);
     Text(dc, L"任务进度", g.rightX + PANEL_PAD, g.top + 6, 300, 34, INK, 24, true);
@@ -1050,6 +1096,11 @@ static void DestroyPageControls() {
     for (auto& e : g_cornerEdits) if (e) { DestroyWindow(e); e = nullptr; }
     if (g_editCharSize) { DestroyWindow(g_editCharSize); g_editCharSize = nullptr; }
     if (g_comboOrient) { DestroyWindow(g_comboOrient); g_comboOrient = nullptr; }
+    if (g_editPageCh) { DestroyWindow(g_editPageCh); g_editPageCh = nullptr; }
+    if (g_editPgCnt) { DestroyWindow(g_editPgCnt); g_editPgCnt = nullptr; }
+    if (g_editTurnWait) { DestroyWindow(g_editTurnWait); g_editTurnWait = nullptr; }
+    if (g_stcTrunc) { DestroyWindow(g_stcTrunc); g_stcTrunc = nullptr; }
+    g_pgEdit = 0; g_pgTotal = 0; g_pgWritten = 0; g_pgPartial = true;
     g_prevCells.clear(); g_prevValid = false;
     g_dragging = false; g_dragIdx = -1;
     g_tv.ok = false;
@@ -1174,6 +1225,24 @@ static void CreateWriteControls(HWND hwnd) {
         SendMessageW(g_comboOrient, CB_ADDSTRING, 0, (LPARAM)ORIENT_LABELS[i]);
     SendMessageW(g_comboOrient, CB_SETCURSEL, (WPARAM)snapI("cfg", "glyph_orient", 0), 0);
 
+    // 第三行：每页字数 / 总页数（分页参数，输入即重切页；配合画布翻页条逐页编辑）
+    g_editPageCh = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                   WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                   L.pcEdX, L.row3Y, L.pcEdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PAGECH, nullptr, nullptr);
+    SendMessage(g_editPageCh, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editPageCh, std::to_wstring(snapI("cfg", "page_chars", 5)).c_str());
+    g_editPgCnt = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                  L.pnEdX, L.row3Y, L.pnEdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PGCNT, nullptr, nullptr);
+    SendMessage(g_editPgCnt, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editPgCnt, std::to_wstring(snapI("cfg", "page_count", 1)).c_str());
+    // 截断提示（文本超容量时点亮，由 RefreshLayoutPreview 更新）
+    g_stcTrunc = CreateWindowExW(0, L"STATIC", L"",
+                                 WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
+                                 L.pnEdX + L.pnEdW + 16, L.row3Y - 2,
+                                 L.resetX - (L.pnEdX + L.pnEdW + 16), 30, hwnd, nullptr, nullptr, nullptr);
+    SendMessage(g_stcTrunc, WM_SETFONT, (WPARAM)g_font16, TRUE);
+
     // 重置画布：清空实时轨迹缓冲，让可编辑字块叠画重新出现（跑过一次任务后可再次编辑）
     MakeBtn(hwnd, { L"重置画布", IDC_BTN_RESETCANVAS, BLUE }, L.resetX, L.row2Y, L.resetW, 26);
 
@@ -1224,6 +1293,18 @@ static void CreateWriteControls(HWND hwnd) {
     }
     MakeBtn(hwnd, { L"清除标定", IDC_BTN_CCLEAR, BLUE }, wp.clearX, wp.clearY, wp.clearW, wp.clearH);
 
+    // ★翻页条控件：◀ ▶ 按钮 + 翻页等待输入（模拟时长；蓝牙接入后仅作兜底等待）
+    MakeBtn(hwnd, { L"\x25C0", IDC_BTN_PAGE_PREV, BLUE },
+            wp.btnPrev.left, wp.btnPrev.top, wp.btnPrev.right - wp.btnPrev.left, wp.btnPrev.bottom - wp.btnPrev.top);
+    MakeBtn(hwnd, { L"\x25B6", IDC_BTN_PAGE_NEXT, BLUE },
+            wp.btnNext.left, wp.btnNext.top, wp.btnNext.right - wp.btnNext.left, wp.btnNext.bottom - wp.btnNext.top);
+    g_editTurnWait = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                     WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                     wp.waitEdX, wp.strip.top + 1, wp.waitEdW, 24, hwnd,
+                                     (HMENU)(INT_PTR)IDC_EDIT_TURNWAIT, nullptr, nullptr);
+    SendMessage(g_editTurnWait, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editTurnWait, std::to_wstring(snapI("cfg", "page_turn_wait_ms", 3000)).c_str());
+
     RefreshLayoutPreview();   // 初次生成排版预览
 }
 
@@ -1257,10 +1338,11 @@ static std::wstring GetEditW(HWND e) {
 
 // 把 layout_preview 结果格式化为中文状态串（回显到只读状态框）
 static std::wstring BuildPreviewStatus(const nlohmann::json& r) {
-    int cnt = r.value("char_count", 0);
-    int orient = r.value("orient", 0);
-    std::wstring od = (orient >= 0 && orient < 4) ? ORIENT_LABELS[orient] : L"—";
-    if (cnt == 0)
+    int cnt = r.value("char_count", 0);                       // 本页字数
+    int all = r.value("text_total", cnt);                     // 全量有效字数
+    std::wstring od = (r.value("orient", 0) >= 0 && r.value("orient", 0) < 4)
+                    ? ORIENT_LABELS[r.value("orient", 0)] : L"—";
+    if (all == 0)
         return L"请输入要书写的汉字；随后在下方画布内拖拽每个字块调整布局（须落在黄色视野框内）。";
     float vw = 0, vh = 0;
     try {
@@ -1268,9 +1350,13 @@ static std::wstring BuildPreviewStatus(const nlohmann::json& r) {
         vw = (float)v.at("x1").get<double>() - (float)v.at("x0").get<double>();
         vh = (float)v.at("y1").get<double>() - (float)v.at("y0").get<double>();
     } catch (...) {}
-    std::wstring head = fmt(L"方向：%s　|　%d 字，字号 %s mm，可写视野 %s×%s mm。",
-                            od.c_str(), cnt, f1((float)r.value("char_size", 0.0)).c_str(),
+    std::wstring head = fmt(L"方向：%s　|　共 %d 字（本页 %d），字号 %s mm，视野 %s×%s mm。",
+                            od.c_str(), all, cnt, f1((float)r.value("char_size", 0.0)).c_str(),
                             f1(vw).c_str(), f1(vh).c_str());
+    std::wstring pg = fmt(L"　分页 %d 页×%d 字/页", r.value("page_total", 0), r.value("page_chars", 0));
+    if (r.value("truncated", false))
+        pg += fmt(L"，超容量仅写前 %d 字", r.value("chars_planned", 0));
+    head += pg + L"。";
     if (!r.value("valid", false)) {
         int ec = r.value("err_code", 0);
         std::wstring why = (ec == LAY_FONT_W) ? L"字号超出可书写视野（请调小字号）" : L"排版不可行";
@@ -1306,6 +1392,29 @@ static void CommitCharSizeField() {
                                          : L"字号已限制在有效范围（60~500mm）。");
 }
 
+// —— 分页整数输入通用（每页字数/总页数/翻页等待）—— //
+// 与字号同样的两段式教训：EN_CHANGE 只在值合法时套用且**不回写文本**；KILLFOCUS 才夹取回写。
+// get/set 分别绑定服务层 getter/setter；lo/hi 为合法闭区间。
+static void ApplyIntField(HWND ed, std::function<bool(int)> setter, int lo, int hi) {
+    if (!ed || g_laySuppress) return;
+    std::wstring v = GetEditW(ed);
+    if (v.empty()) return;
+    long n = _wtol(v.c_str());
+    if (n < lo || n > hi) return;                 // 还没打完整：不套用也不改框
+    setter((int)n);
+}
+static void CommitIntField(HWND ed, std::function<bool(int)> setter, int lo, int hi, const wchar_t* name) {
+    if (!ed) return;
+    std::wstring v = GetEditW(ed);
+    long f = v.empty() ? lo : _wtol(v.c_str());
+    int eff = (int)(f < lo ? lo : (f > hi ? hi : f));
+    setter(eff);
+    g_laySuppress = true;
+    SetWindowTextW(ed, std::to_wstring(eff).c_str());
+    g_laySuppress = false;
+    if (f != eff) SetResult(fmt(L"%s已限制在有效范围（%d~%d）。", name, lo, hi));
+}
+
 // 实时刷新排版预览：任务运行中冻结（不改全局、不叠画）；否则据当前文本重算并缓存字块 + 回显状态
 static void RefreshLayoutPreview() {
     if (!g_st.hwnd) return;
@@ -1313,6 +1422,17 @@ static void RefreshLayoutPreview() {
     std::wstring t = g_editText ? GetEditW(g_editText) : L"";
     nlohmann::json r = gs::layout_preview(to_u8(t));
     g_prevCells.clear(); g_prevValid = r.value("valid", false);
+    g_pgEdit = r.value("page", 0); g_pgTotal = r.value("page_total", 0);
+    g_pgWritten = r.value("written_pages", 0);
+    g_pgPartial = r.value("partial", true);
+    if (g_stcTrunc) {
+        std::wstring tip;
+        if (r.value("truncated", false))
+            tip = fmt(L"超出容量：只写前 %d 字（+%d 字未纳入）", r.value("chars_planned", 0),
+                      r.value("text_total", 0) - r.value("chars_planned", 0));
+        SetWindowTextW(g_stcTrunc, tip.c_str());
+        InvalidateRect(g_stcTrunc, nullptr, TRUE);
+    }
     if (r.contains("cells")) {                     // 无论是否“可行”都取回字块：允许重叠、可拖拽分开
         for (auto& c : r["cells"]) {
             PrevCell pc;
@@ -1326,10 +1446,10 @@ static void RefreshLayoutPreview() {
 }
 
 // —— 字块拖拽辅助 —— //
-// 仅“规划态”可拖：书写页 + 固定视野就绪 + 有字块 + 非任务中 + 无历史轨迹（允许重叠也可拖开）。
+// 仅“规划态”可拖：书写页 + 固定视野就绪 + 有字块 + 非任务中 + 显示页==编辑页 + 无历史轨迹
+//（允许重叠也可拖开；任务跑过后轨迹未清则不可编辑，需“重置画布”，与 gs::page_drag_enabled 同语义）。
 static bool CanDragCells() {
-    return g_st.page == ID_PAGE_WRITE && g_tv.ok && !g_prevCells.empty()
-        && !gs::task_active() && gs::trail::commandedSize() == 0;
+    return g_st.page == ID_PAGE_WRITE && g_tv.ok && !g_prevCells.empty() && gs::page_drag_enabled();
 }
 // 命中测试：返回包含屏幕点 (px,py) 的字块下标（取最后绘制者=上层），无则 -1。
 static int HitCell(int px, int py) {
@@ -1463,8 +1583,11 @@ static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
         std::wstring t = GetEditW(g_editText);
         if (t.empty()) { SetResult(L"请输入要书写的汉字或诗句。", true); break; }
         RefreshLayoutPreview();               // 以当前文本/排版重判有效性
-        if (!g_prevValid) { SetResult(L"当前排版放不下（或无有效汉字），请先调整字号/布局再开始。", true); break; }
-        if (gs::start_write(to_u8(t), err)) SetResult(L"书写任务已启动（预热→书写→可选蘸墨→自动描边）。");
+        if (!g_prevValid || g_prevCells.empty()) {
+            SetResult(L"当前排版放不下（或本页无有效汉字），请先调整字号/分页/布局再开始。", true); break;
+        }
+        if (gs::start_write(to_u8(t), err))
+            SetResult(fmt(L"书写任务已启动：共 %d 页，页间自动翻页（当前为模拟等待）。", g_pgWritten));
         else SetResult(fmt(L"启动失败：%s", to_ws(err).c_str()), true);
         break;
     }
@@ -1472,6 +1595,15 @@ static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
         if (gs::abort_task()) SetResult(L"已请求停止任务（经急停通道，抬起笔后结束）。", true);
         else SetResult(L"当前没有运行中的任务。");
         break;
+    case IDC_BTN_PAGE_PREV:
+    case IDC_BTN_PAGE_NEXT: {
+        if (gs::task_active()) { SetResult(L"任务运行中画布跟随书写页，不能切换编辑页。", true); break; }
+        int cur = gs::edit_page();
+        int np = (id == IDC_BTN_PAGE_PREV) ? cur - 1 : cur + 1;
+        if (np < 0 || np >= gs::page_entry_count()) { SetResult(L"已到页首/页尾。"); break; }
+        if (gs::set_edit_page(np)) RefreshLayoutPreview();
+        break;
+    }
     case IDC_BTN_SPEED_DEC:
         if (gs::set_speed(snapI("cfg", "speed", 3) - 1)) SetResult(L"速度已调低一档。");
         else SetResult(L"速度已是最低档。");
@@ -1556,8 +1688,12 @@ static void DoPreflight(HWND hwnd) {
     int orient = r.value("orient", 0);
     std::wstring od = (orient >= 0 && orient < 4) ? ORIENT_LABELS[orient] : L"—";
     if (r.value("layout_ok", false)) {
-        out = fmt(L"预检通过（自由拖拽排版）：%d 字，字号 %s mm，字体朝向：%s，速度 %d 档。\r\n%s%s\r\n（预检不发送任何运动指令；书写按画布所见即所得）",
-                  r.value("char_count", 0),
+        std::wstring trunc = r.value("truncated", false)
+                           ? fmt(L"（输入 %d 字已截断）", r.value("text_total", 0)) : std::wstring();
+        out = fmt(L"预检通过（自由拖拽排版·分页）：%d 页×%d 字/页，实际书写 %d 字%s，字号 %s mm，字体朝向：%s，速度 %d 档。\r\n%s%s\r\n（预检不发送任何运动指令；书写按画布所见即所得，页间自动翻页）",
+                  r.value("page_total", 0), r.value("page_chars", 0),
+                  r.value("chars_planned", 0),
+                  trunc.c_str(),
                   f1((float)r.value("char_size", 0.0)).c_str(),
                   od.c_str(),
                   r.value("speed", 3),
@@ -1613,6 +1749,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_checks[2]) SendMessage(g_checks[2], BM_SETCHECK, snapB("cfg", "high_quality") ? BST_CHECKED : BST_UNCHECKED, 0);
                 if (g_checks[3]) SendMessage(g_checks[3], BM_SETCHECK, snapB("cfg", "enable_dip") ? BST_CHECKED : BST_UNCHECKED, 0);
                 if (g_checks[5]) SendMessage(g_checks[5], BM_SETCHECK, snapB("cfg", "enable_dunbi") ? BST_CHECKED : BST_UNCHECKED, 0);
+                RefreshLayoutPreview();   // 任务结束：刷新分页缓存/状态框（画布仍按轨迹门控显示叠画与否）
             }
             s_lastTask = act;
             InvalidateRect(hwnd, nullptr, FALSE);
@@ -1628,6 +1765,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (code == EN_CHANGE && ctl == g_editText) { RefreshLayoutPreview(); return 0; }
             if (code == EN_CHANGE && ctl == g_editCharSize) { ApplyCharSizeField(); RefreshLayoutPreview(); return 0; }
             if (code == EN_KILLFOCUS && ctl == g_editCharSize) { CommitCharSizeField(); RefreshLayoutPreview(); return 0; }
+            if (code == EN_CHANGE && ctl == g_editPageCh)  { ApplyIntField(g_editPageCh, gs::set_page_chars, 1, 50); RefreshLayoutPreview(); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editPageCh) { CommitIntField(g_editPageCh, gs::set_page_chars, 1, 50, L"每页字数"); RefreshLayoutPreview(); return 0; }
+            if (code == EN_CHANGE && ctl == g_editPgCnt)   { ApplyIntField(g_editPgCnt, gs::set_page_count, 1, 20); RefreshLayoutPreview(); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editPgCnt) { CommitIntField(g_editPgCnt, gs::set_page_count, 1, 20, L"总页数"); RefreshLayoutPreview(); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editTurnWait) { CommitIntField(g_editTurnWait, gs::set_page_turn_wait_ms, 500, 60000, L"翻页等待(ms)"); return 0; }
             if (code == CBN_SELCHANGE && id == IDC_COMBO_ORIENT) {
                 int sel = (int)SendMessageW(g_comboOrient, CB_GETCURSEL, 0, 0);
                 if (gs::task_active()) {
@@ -1754,6 +1896,8 @@ int Run() {
 
     // 初始化服务层：GUI 来源 = HUMAN
     gs::set_source("GUI", "HUMAN");
+    // ★翻页蓝牙模块预留锚点：接入时在此 gs::set_page_turn_handler(真实信号实现)；
+    //   未注入则服务层用 page_turn_wait_ms 模拟等待（任务线程内分片可被停止/急停打断）。
     gs::cfg_load();
     g_st.snap = gs::snapshot();
 
