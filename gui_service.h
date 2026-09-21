@@ -137,6 +137,25 @@ using PageTurnFn = std::function<bool(int page_no_1based, int page_total)>;
 void set_page_turn_handler(PageTurnFn fn); // 注入真实蓝牙翻页实现（传 nullptr 恢复默认模拟）
 bool set_page_turn_wait_ms(int ms);        // 模拟等待时长 500~60000ms，持久化
 int  page_turn_wait_ms();
+
+// —— 蓝牙翻页（2026-09-21 接入，见 ble_motor.h）—— //
+// 真信号 = 板子回 DONE（闭合环，不是定时器猜）。链路 = BLE GATT 透传（FFE0/FFE1）。
+// 三个参数都做成 GUI 可调并持久化；关闭蓝牙翻页时自动回退到上面的模拟等待。
+void page_turn_install();                  // 注册翻页回调（Run() 启动时调一次即可）
+void page_turn_shutdown();                 // 退出前优雅收尾（断开 GATT + 停工作线程）
+bool set_page_turn_ble(bool on);           // 启用/停用蓝牙翻页（持久化）
+bool page_turn_ble();
+bool set_page_turn_gear(int gear);         // 档位 0~50（持久化）
+int  page_turn_gear();
+bool set_page_turn_run_ms(int ms);         // 每次转动时长 100~600000ms（持久化）
+int  page_turn_run_ms();
+bool set_ble_address(const std::string& addr12);  // 12 位十六进制（可带冒号）
+std::string ble_address();
+// —— 蓝牙状态 / 手动连接（GUI 用）—— //
+std::string ble_status_line();             // 例：已连接 / 未连接 / 异常：服务被其他程序占用
+bool ble_connect(std::string& err);        // 发起连接（非阻塞，返回是否已受理）
+void ble_disconnect();
+bool ble_available();                      // 本机 WinRT 蓝牙是否可用
 bool preview_writing_plane(float z, std::string& err);  // 移到 (0,0,z) 悬停，确认书写高度（不书写）
 bool set_writing_plane(float z, std::string& err);      // 保存书写平面 Z：生效 + 持久化（后续书写统一用该 Z）
 // —— 四角标定（实时轨迹面板）：预览=抬笔移到该角(真机移动)；保存=固定并持久化；清除=复位 —— //

@@ -5,6 +5,14 @@
 > 出现阶段完成、方向变化、失败尝试、准备结束会话时，必须更新本文件。
 
 ## 当前任务
+**（已实现·编译+启动+正常关闭全通过·待真机闭环验收）蓝牙翻页接入（2026-09-20/21）**：把 `Run()` 里的预留锚点换成真信号实现 —— 每页写完发 `RUN<档位>,<时长>` 给 STM32+TB6612+直流电机，**等板子回 `DONE`** 才算翻页成功（闭环，不是定时器猜）。用户四项决策：①翻页机构就用「STM32+TB6612+直流电机」那套；②完成判定必须闭合环（要回位信号），板子回「转完了」即可，不加位置传感器；③链路方法不限但**要集成进 GUI**；④翻页参数（档位/时长）做成 **GUI 上可调**。
+- 新增 `ble_motor.{h,cpp}`（唯一新文件，未改 hanzi/motion/serial_port/gui_trail 的内核逻辑）：**纯 WinRT** 实现 BLE GATT 透传。单工作线程独占 WinRT（进 MTA），对外只暴露 `exec(line, want, timeout, canceled, got, err)` 阻塞式闭环调用 + 状态查询/连接控制。链路：`BluetoothLEDevice.FromBluetoothAddressAsync` → `GetGattService(FFE0)` → `IGattDeviceService3`（RequestAccessAsync + **OpenAsync(SharedReadAndWrite)**）→ `GetCharacteristicsWithCacheModeAsync(**Uncached**)` → FFE1 → `add_ValueChanged` + `WriteClientCharacteristicConfigurationDescriptorWithResultAsync(Notify)`；写用 `IGattCharacteristic3::WriteValueWithResultAsync`。
+- `gui_service.{h,cpp}`：`page_turn_install()` 注册回调（`Run()` 里 `cfg_load()` 之后调用，替换原锚点注释）；回调内「确保链路（未连接则自动建链，最多等 40s）→ 发 RUN → 等 DONE」，**回调不持 g_mu**（调用点本就无锁），所以长阻塞不会卡 UI；取消语义沿用 `g_task_cancel||g_estop`，命中立即放弃。新增 4 个持久化配置键 `page_turn_ble/page_turn_gear(0~50,默认30)/page_turn_run_ms(100~600000,默认3000)/ble_addr(默认21F6473AD889)` + setter/getter + snapshot 暴露 + 审计事件 `page_turn_ble`（含 cmd/gear/run_ms/result/elapsed_ms/detail）。`page_turn_shutdown()` 退出时断开 GATT + 停工作线程。
+- `gui_win32.cpp`：翻页条下新增第二行「[✓]蓝牙翻页　档位(0~50)：[ ]　时长(ms)：[ ]　[连接蓝牙]　状态文本」。档位/时长沿用**两段式整数框**（EN_CHANGE 合法即套用不回写、KILLFOCUS 夹取回写，同字号/每页字数教训）；`WritePlotGeo` 新增 `strip2` 几何并把下方四角标定区整行下移（避免盖住）；新增复选框必须紧邻 `IDC_CHECK_*` 块（按 `id-IDC_CHECK_DRY` 索引）；`IDC_BTN_BLECONN` 加入 `DrawBtn` 的 TEAL 组；`WM_DESTROY` 里调 `gs::page_turn_shutdown()`。
+- `build.bat`：`COMMON` 加 `ble_motor.cpp`；两个目标都加 `-lruntimeobject -lwindowsapp -lole32 -luuid`（WinRT 需要；控制台目标之前没有任何 -l，同样要加）。
+- 验证：两个目标 g++ 链接 **RC=0**（只剩改动前就有的 `g_auto_draw_used`/`shanshui_gen.hpp` 警告）；`RobotGUI.exe` 启动冒烟「已加载配置 robot_config.json」且 8s 存活；用 `CloseMainWindow()` 发 WM_CLOSE 走**正常关闭路径**，进程 4s 内退出、**无 terminate/崩溃**。另有独立验收工具 `ble_selftest.exe`（在 workspace `tmp/ble_poc/`，链工程内 `ble_motor.cpp`），可在不开 GUI 的情况下单独跑「建链→发 RUN→收 DONE」。
+- **✓ 真机闭环验收已通过（2026-09-21 20:35）**：模块上电后 `scan.py` 15s 扫描到 `21:F6:47:3A:D8:89  rssi=-65  HC-05`，随即 `ble_selftest.exe` 一次跑通：**建链 2.30 s → 发 `RUN30,3000` → 3.33 s 后收到 `DONE 30 3000`，EXIT=0**（电机实际转了 3 秒）。**「模块不可达 = 没上电」的结论被验证实**，软件侧零改动即通。顺带印证：模块在广播时建链只要 **2.3 s**（昨天不可达时是 25 s 后失败），所以「**连不上先扫描**」这条方法论成立。剩余待办只有 GUI 整任务验收与手感标定。
+
 **（已实现·离线单测78/78+dryrun端到端+Computer Use实操全通过·待真机）GUI 书写任务「分页 + 翻页」（2026-09-20）**：一页写完→向翻页机构发信号→等翻页→抬笔清轨迹→写下一页。用户四项决策：①每页独立布局可逐字拖拽；②翻页走纸量=版面高、坐标重合（不做偏移补偿）；③超容量只写前 N×每页 字（截断）；④翻页等待期点停止/急停立即中止不翻页。实现要点（**仅改 `gui_service.{h,cpp}`+`gui_win32.cpp`**，未碰 hanzi/motion/serial_port/gui_trail）：
 - 服务层分页模型：`g_full_all`(过滤后全量不截断)/`g_full_text`(截断到容量=实际书写)/`g_pages`(每页 `PageEntry{text,cells}`)/`g_page_chars`(1~50)/`g_page_count`(1~20)/`g_edit_page`+`g_write_page`(atomic)双游标。`rebuild_pages` 切页并**三级继承拖拽坐标**（同下标同文本→按文本认领→按字首次出现继承，全不中才补初始网格），保证改页数/每页字数/容量恢复不丢摆位。
 - 翻页预留接口：`gs::PageTurnFn=set_page_turn_handler(fn)`，默认 `page_turn_wait_locked()` 持 g_mu 分片 50ms 睡眠并轮询 `g_task_cancel||g_estop`（命中返回 false→不翻页→任务 canceled）。GUI `Run()` 有注入锚点注释。审计事件 `page_turn`(发信号)/`page_turn_result`(ok/canceled/turn_failed)。
@@ -25,6 +33,13 @@
 - 上一轮 Win32 GUI 已完成，本轮不动既有三页布局。
 
 ## 下一步 / 待办（新增或承接）
+- **★ 2026-09-21 晚·BLE 判据修正（先读这条）**：`tmp/ble_poc/winrt_probe.py` 实测模块 **`connection_status = Connected (1)`** —— 模块**与 PC 已配对、Windows 常驻持着链路** → 它**不广播** → `scan.py`/bleak **必然扫不到（假阴性）**，而 WinRT 按地址访问是 0.1s 级。**「扫不到」不等于「模块不在」**（9-20 的结论已纠正，详见 `bugs.md` 末节）。CLI 闭环复测通过：建链 **0.56 s** → `DONE 30 3000`。
+- **★ 蓝牙翻页 GUI 整任务 DRYRUN 已通过（2026-09-21 21:01）→ 当前处于「真机实测」阶段**：审计 `logs/audit_20260921_210129.jsonl`（524 事件，`task_preflight ok → task_start → page_turn → page_turn_ble ok(DONE 30 3000, 3308ms) → page_turn_result ok → task_end ok`），2 页 × 5 字「欲穷千里目更上一层楼」全程跑通。**注意 `task_end.progress.chars_total` 是「每页」计数不是总量**，5/5 属正常，勿误判为漏写。
+  - **真机实测步骤见项目根 `真机实测步骤.md`**（本轮新增）：分 6 阶段递进 —— ①开工前核对（关 Dry Run / 选 COM4 / 手放电源）②通信链路（连接→心跳→查询位姿，臂不动）③小幅度动作（回中心→测试点）④落笔深度（书写平面页 模拟悬停 目视）⑤**走纸量标定**（臂不动，只发电机指令）⑥单页试写真落笔 ⑦多页+翻页整任务。
+  - **真机阶段的第一个未知量 = 走纸量**：程序**不做偏移补偿**，下一页与当前页世界坐标完全重合，所以一次翻页走纸必须≈版面高。当前排版字高 60 + 行距 8 → 目标 **≈68mm**；须用 `RUN<档位>,<时长>` 实测距离反算时长（档位固定 30 只调时长，改档位不成线性）。
+  - ⚠ 做 CLI 电机标定前**必须先取消勾选 GUI 的「蓝牙翻页」**：BLE 一次只服务一个中心设备，GUI 翻过一次页后会一直占着链路。
+- 翻页档位/时长的**手感标定**：默认 30 档 / 3000ms 只是可跑通的起点，需按真实走纸机构的走纸量与速度微调（GUI 上直接改即可，会自动存进 `robot_config.json`）。
+- **注**：`motor_ble_gui.py` 与本工程现在**抢同一个模块**，两者不要同时用。
 - **Phase2：书写方向 已完成（离线验证过·待视觉核验）**——`g_write_dir`(0横排/1竖排右起)+config 键+`set_write_dir`+snapshot+preflight/`layout_preview` 回显 dir；hanzi 抽出方向感知 `grid_extents`/`fill_offsets`，`plan_manual_layout` 与 `plan_text_area_and_layout` 加 `dir` 参（`dir=0` 逐点保持旧行为；竖排右起=列内从上到下、列从右往左，fit 轴向交换）；自动模式竖排候选改偏好短列 `{4,3,2,5}`（横排仍 `{5,4}`）；GUI 书写页加“竖排(右起)”复选框 `g_chkVert`（独立于自动/手动），状态框随方向显示网格。编译链接 RC=0 无新 warning；方向单测 19/19 PASS（竖排字序、轴向交换、自动短列候选、横排回归）；p2 GUI 启动 Responding=True。未验证：书写页视觉叠画与方向端到端仍需关旧实例后用新 `RobotGUI.exe` 实操核验。
 - 运行态提醒：`robot_config.json` 当前是某次手动模式测试写入的状态（`layout_mode:1/layout_cols:1/layout_top_ratio:0.9`，且无 `write_dir` 键——由 Phase1 期构建保存），非源码改动；如需回到干净默认，可勾“恢复自动”或在 config 里改。
 - **可达极限已探明 + 实验已撤销（2026-09-19）**：把 `dev_limit` 临时放宽到 ±180 真机测试，臂仍**稳定停在 X±162 / Y±85** → 限制在**控制器/机构侧，非软件**。随后按用户要求**撤销整个可达边界实验回原版**：`g_devLimit` 恢复固定 ±180，删除 `cfg_save/cfg_load` 的 `dev_limit`、`snapshot.cfg.dev_limit`、`robot_config.json` 的 `dev_limit` 键；重编 RC=0。保留四角标定/轨迹面板/结果提示。**结论留存**：真机上电可达 X±162/Y±85（断电可手推越过），疑控制器工作区软限位（手册 ±180 但固件设小）；软件无解，需问厂商放参数或改机械。
@@ -98,6 +113,7 @@
 - 未修（已记录）：点“连接设备”仍在 UI 线程打开串口（选到蓝牙虚拟口会同样卡死），需改成工作线程 + 打开期间不持 `g_mu`，见 bugs.md。
 
 ## 阶段变更记录
+- 2026-09-21（晚·真机实测阶段启动）：**GUI 整任务 DRYRUN 验收通过并转入真机实测**。①读出用户 Dry Run 那次的完整审计链（`audit_20260921_210129.jsonl`，21:01:29→21:03:16，524 事件）：`task_preflight ok(2页×5字) → task_start → page_turn(->第2页) → page_turn_ble ok(detail="DONE 30 3000", elapsed 3308ms) → page_turn_result ok → task_end ok`，并确认 **Dry Run 下翻页走的是真蓝牙**（`page_turn_ble` 事件带真实 `DONE` 回包），即 Dry Run 只模拟机械臂、管不到蓝牙翻页。②澄清 `progress.chars_total=5` 是**每页**计数（`task::page_begin` 语义），非漏写第 2 页。③核实真机现场：`USB-SERIAL CH340 (COM4)` 已插（此前无任何串口），GUI 实例 PID 12332（20:39 启动）；**`g_dryRun` 不落盘**，默认 false 仅 `--dryrun` 置位（`robot_common.cpp:45`），故重启 GUI 即真实模式。④核实书写 Z 实际取值：config `writing_plane_valid=true` + `writing_plane_z=-365` → `hanzi.cpp:92` 落笔全用 -365，抬笔 `Z_UP=-325`，**均落在文档实测安全区间 -320~-385 内**；但 config `z_limits=[-320,-410]` 与 `z_layers` 末位 `-388` **超出实测底限 -385**（仅在「书写平面」失效或开「顿笔」时才会触发，当前两者都关，故安全）。⑤新增 `真机实测步骤.md`（6 阶段递进 + 红线 3 条 + 审计事件对照表 + BLE 状态码处置表）；修正 `使用说明.md` 两处**已过时**表述（§5.3 与 §9-7 仍写"翻页为模拟等待"，已改为真实 BLE 闭环），并在 §9「上机前必读」补第 9、10 条（Dry Run 管不到蓝牙翻页；BLE 模块一次只服务一个中心设备）。**本轮代码零改动。**
 - 2026-09-16：完成比赛/协议/设计方案核对及第一轮源码修复。
 - 2026-09-17：完成 Terra 第二轮审查；修复错误传播、预定位估时、输入和调试几何校验；建立 CodeGraph 和 GUI 状态边界。
 - 2026-09-17：完成编译、dryrun、CodeGraph 同步和差异检查。
@@ -126,6 +142,8 @@
 
 - 2026-09-20（本窗口）：书写任务**分页 + 翻页**功能落地（用户新需求，见「当前任务」首条详述）。一页写完→发翻页信号（当前模拟等待）→等翻页→抬笔清轨迹→写下一页；每页独立可拖拽布局、超容量截断只写前 N 字、翻页等待期停止/急停立即中止（用户四项决策）。改动仅 `gui_service.{h,cpp}`+`gui_win32.cpp`（未碰 hanzi/motion/serial_port/gui_trail）；config 新增 page_* 键并兼容旧 free_* 迁移。验证：g++ 链接 RC=0 无新 warning；`verify_pages` 单测 78/78 PASS（含 7.4 等待期 abort 立即中止）；dryrun 审计链 `page_turn→page_turn_result=ok`；Computer Use 实操确认切页/每页隔离拖拽/翻页后轨迹清空重播所见即所得。临时测试文件移出项目目录、config 运行态 git checkout 还原。待真机：走纸精度=版面高？软件位姿不变？真实蓝牙替换模拟（`Run()` 锚点 `set_page_turn_handler`）？详见 context.md「分页 + 翻页约定（2026-09-20）」。
 
+- 2026-09-20（深夜·本窗口）：蓝牙翻页闭环验收**把失败根因定位到硬件**。关掉用户的 `motor_ble_gui.py`(PID 12428) 后复验，`OpenAsync` 由 `SharingViolation(4)` 变为 `Success(1)`（证明该工具确实是之前的占用者），但**仍失败**：特征枚举 `GattCommunicationStatus=1 Unreachable`、每次耗时 7.75s；`bleak` 主动扫描两次都扫不到模块；新诊断 `[link=0 ...]` 说明 PC 侧**根本没有链路**（排除幽灵链路）。→ **结论：模块在空口上不可达 = 没上电（或正被手机占着）；非软件问题**。同时修掉代码诊断盲点：`ble_motor.cpp` 原先把 `Unreachable` 笼统报成“找不到 FFE1 特征（模块未就绪或服务未广播）”，现按状态码分诊并附 `[link= open= comm= n=]`；新建 `tmp/ble_poc/scan.py`（bleak 扫描）作为“硬件在不在”的第一个检查项。`ble_selftest.exe` 重新编译 **RC=0**（逻辑未改，仅加诊断）。改动文件：`ble_motor.cpp`（仅诊断）。**未改**任何 GPIO/写字节/时序/协议代码。
+- 2026-09-21：**蓝牙翻页真机闭环验收通过**。用户给模块上电后，`scan.py` 立即扫到目标（`rssi=-65`），`ble_selftest.exe` 一次跑通：建链 2.30s → `RUN30,3000` → 3.33s 收到 `DONE 30 3000`（EXIT=0，电机真转）。**证实 9-20 的定因正确（模块没上电），且从 9-20 到 9-21 软件侧一行未改即通**。对照数据：可达时建链 2.3s，不可达时要空等 25s 才报错 —— 可用于快速判断模块在不在。代码侧本轮无改动（只跑验收 + 更新记录）。
 ## 验证说明
 - 已验证：GUI 预检/开始书写/停止三条操作路径的审计事件落盘正确；控制台 DRYRUN 帧序列与拆分前基线逐帧一致；`build.bat` 一次产出两个 exe 并冒烟通过。
 - 已验证（2026-09-18）：三页截图三张互不相同且逐页目视检查通过；GUI 预检再次实测 `task_preflight result=ok`。本轮只改 `gui_win32.cpp`（`git status` 仅此一个文件），未触及控制台与共享服务层，故未重跑帧级回归。
@@ -133,3 +151,11 @@
 - 已知环境限制：`Robot.exe` 交互式写字需约 8 分钟（单字 3749 点 DRYRUN），本轮以 5 分钟窗口截取前段对比；控制台 stdin 重定向在 EOF 后不退出，需显式输入菜单 4。
 - 已知环境限制：本机 `CopyFromScreen` 截图会返回冻结帧，核验必须“强制重绘 + PrintWindow + md5 比对”三步并用。
 - 未验证：真实硬件（无设备接入），所有运动均为 DRYRUN 模拟帧；GUI 未在 100% 缩放与高 DPI 之外的分辨率下核验布局；未从非项目目录启动 GUI 的路径解析问题尚未修（见 bugs.md）。
+
+- 2026-09-21（晚·本窗口）：**修正 BLE「判在不在」的判据 + CLI 复测通过**。`ble_selftest.exe` 通过：建链 **0.56 s** → `RUN30,3000` → 3.31 s 收到 `DONE 30 3000`，EXIT=0（电机真转）。但同环境 `scan.py` 13s×2 **扫不到**、bleak 按地址连报 `DeviceNotFound(30s)`。用系统 Python 的 `winrt-*` 直读 WinRT：`FromBluetoothAddressAsync` **0.06 s** 拿到设备、`name='HC-05'`、**`connection_status = Connected (1)`**、`GetGattServicesWithCacheModeAsync(Uncached)` 0.36 s 返回 3 个服务（1800/1801/FFE0）→ **模块与 PC 已配对（`BTHPORT\...\Devices` 下有 `21f6473ad889` 记录），Windows 常驻保持链路，模块因此停止广播**。→ **新判据：扫描阳性可信、阴性不可信；决定性判据 = 「能否拿到设备对象 / 建链耗时」（0.1~0.6s=链路已在 / 2~3s=刚在广播 / 空等 25s=不在）。** 新增工具 `tmp/ble_poc/winrt_probe.py`（只读状态、不发运动指令，0.5s 出结果）；同步修正 workspace `电脑端蓝牙控制工具\蓝牙翻页验收清单.md` 与技能 `hc05-classic-bt-troubleshoot`（新增 1.8 节）。另发现并记录：**`g_dryRun` 管不到翻页**（翻页走 BLE 不是串口）→ Dry Run + 勾蓝牙翻页 = 臂不动、电机真转。**本轮代码零改动**（只新增诊断脚本 + 文档）。下一步：GUI 整任务验收（Dry Run 先跑）+ 手感标定。
+- 2026-09-21（晚·本窗口）：**修 UI「按钮跑到别的页上」+ 跨进程探针验证通过**。
+  - 根因：`MakeBtn` 的 `g_btns[64]`（下标 = ID−1000）在 ID ≥ 1064 时越界登记失败，`IDC_BTN_PAGE_NEXT`(1064)、`IDC_BTN_BLECONN`(1067) 永远销毁不掉 → 切页残留、逐次累积。
+  - 修法：`DestroyPageControls(hwnd)` 改为枚举主窗口直接子窗口统一销毁（不再按 ID 记账）；并修 `DrawBtn` 同源越界判断导致的 `连接蓝牙` 配色错误；按实测字宽修该行尺寸（`连接蓝牙` 80px 原按钮 70px 被截成「连接…」）。
+  - 验证：新写 `tmp/ble_poc/probe_children.exe`（跨进程枚举直接子控件 + 模拟点导航）做 A/B。旧实例主页 49→51 个控件且必现两个残留按钮；新实例各页恒为 19/5/35/3，无残留。
+  - 新增工具：`tmp/ble_poc/probe_children.cpp/.exe`、`tmp/ble_poc/measure_text.cpp`（按 GDI 字体实测文案像素宽，避免拍脑袋定控件宽度）。
+  - **未完成**：`RobotGUI.exe` 被运行中的实例（pid 12332）占用无法覆盖，修复版暂存为 `RobotGUI_fix.exe`；关闭旧 GUI 后需替换并改名。

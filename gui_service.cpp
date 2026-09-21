@@ -8,6 +8,7 @@
 //     task::progress 钩子在 motion.cpp 内更新，GUI 侧只读快照。
 #include "gui_service.h"
 #include "gui_trail.h"
+#include "ble_motor.h"
 
 #include <atomic>
 #include <chrono>
@@ -95,6 +96,14 @@ int                      g_edit_page   = 0;         // 编辑页游标（空闲�
 std::atomic_int          g_write_page{ 0 };         // 书写页游标（任务线程正在写的页，UI 只读）
 std::atomic_bool         g_task_finished{ false };  // 本进程至少完成/中止过一次任务（叠画门控）
 PageTurnFn g_page_turn;   // 空 = 默认模拟等待（调用处兜底 page_turn_wait_locked）
+
+// —— 蓝牙翻页参数（2026-09-21 接入；随 robot_config.json 持久化）—— //
+// 真信号 = 板子回 DONE，闭合环。关闭开关时回退到 g_page_turn_wait_ms 模拟等待。
+bool        g_page_turn_ble    = false;      // 启用蓝牙翻页
+int         g_page_turn_gear   = 30;         // 档位 0~50（占空比由板子换算）
+int         g_page_turn_run_ms = 3000;       // 每次转动时长 ms
+std::string g_ble_addr         = "21F6473AD889";   // 模块蓝牙地址（12 位十六进制）
+bool        g_ble_inited       = false;      // ble_motor 是否已 start()
 constexpr float      REACH_X = 162.0f;            // 未标定四角时的可达回退半宽（真机实测 X±162）
 constexpr float      REACH_Y = 85.0f;             // 未标定四角时的可达回退半高（真机实测 Y±85）
 
@@ -425,6 +434,9 @@ json snapshot() {
         { "free_char_size", g_free_char_size }, { "glyph_orient", g_glyph_orient },
         { "page_chars", g_page_chars }, { "page_count", g_page_count },
         { "edit_page", g_edit_page }, { "page_turn_wait_ms", g_page_turn_wait_ms },
+        { "page_turn_ble", g_page_turn_ble }, { "page_turn_gear", g_page_turn_gear },
+        { "page_turn_run_ms", g_page_turn_run_ms }, { "ble_addr", g_ble_addr },
+        { "ble_state", ble_status_line() },
         { "task_finished", (bool)g_task_finished },
         { "text_total", (int)g_full_all.size() },
         { "text_written", (int)g_full_text.size() } };
@@ -1029,6 +1041,155 @@ bool set_page_turn_wait_ms(int ms) {
 }
 int page_turn_wait_ms() { return g_page_turn_wait_ms; }
 
+// ---------------- 蓝牙翻页接入（2026-09-21；详见 ble_motor.h） ----------------
+// 设计要点：
+//   * 回调在【不持 g_mu】的上下文被调用（见页循环调用点），所以这里可以放心做
+//     最长十几秒的阻塞等待；GUI 靠 snapshot() 的 500ms 定时器继续刷新，界面不会卡死。
+//   * 取消语义沿用原设计：停止/急停命中 → 立即放弃本次翻页返回失败。
+//     （板子自己会把那 N 毫秒转完 —— 机械侧固有延迟，软件侧不再等。）
+//   * 未连接时首次翻页会自动建链（约十几秒），之后复用同一条链路，后续翻页只需几百毫秒。
+void page_turn_install() {
+    if (!g_ble_inited) {
+        blem::start();
+        blem::set_address_hex(g_ble_addr);
+        g_ble_inited = true;
+    }
+
+    set_page_turn_handler([](int page_no, int page_total) -> bool {
+        (void)page_total;
+        auto canceled = [] { return g_task_cancel.load() || g_estop.load(); };
+
+        if (!g_page_turn_ble) return page_turn_wait_locked();   // 开关关着 → 保持原模拟等待
+
+        // 1) 确保链路就绪
+        if (blem::state() != blem::St::Ready) {
+            if (blem::state() != blem::St::Connecting) blem::request_connect();
+            auto t0 = std::chrono::steady_clock::now();
+            for (;;) {
+                if (canceled()) return false;
+                blem::St st = blem::state();
+                if (st == blem::St::Ready || st == blem::St::Error) break;
+                if (std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - t0).count() > 40) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (blem::state() != blem::St::Ready) {
+                // 建链失败：记一条审计，方便事后追因
+                json ev = op_event("page_turn_ble", nullptr);
+                ev["parameters"] = { { "page", page_no }, { "stage", "connect" } };
+                ev["result"] = "fail";
+                ev["detail"] = blem::last_error();
+                audit_write(ev);
+                return false;
+            }
+        }
+
+        // 2) 发指令并等 DONE（真回包 = 闭环成立）
+        const std::string cmd = "RUN" + std::to_string(g_page_turn_gear) + ","
+                              + std::to_string(g_page_turn_run_ms);
+        std::string got, err;
+        auto t1 = std::chrono::steady_clock::now();
+        const bool ok = blem::exec(cmd, "DONE",
+                                   g_page_turn_run_ms + 6000, canceled, got, err);
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - t1).count();
+
+        {
+            json ev = op_event("page_turn_ble", nullptr);
+            ev["parameters"] = { { "page", page_no }, { "cmd", cmd },
+                                 { "gear", g_page_turn_gear }, { "run_ms", g_page_turn_run_ms } };
+            ev["result"] = ok ? "ok" : "fail";
+            ev["elapsed_ms"] = (double)ms;
+            ev["detail"] = ok ? got : (err.empty() ? blem::last_error() : err);
+            audit_write(ev);
+        }
+        return ok;
+    });
+}
+
+// 退出前优雅收尾：先显式断开（释放 GATT 会话），再停工作线程。
+// 不做这一步，Windows 可能仍持着会话，下次启动会直接撞 SharingViolation。
+// 另：ble_motor 的工作线程是 detach 的，必须在进程退出前主动 stop()，
+// 否则静态销毁阶段会打 "terminate called without an active exception" 崩溃。
+void page_turn_shutdown() {
+    if (!g_ble_inited) return;
+    blem::request_disconnect();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    blem::stop();
+    g_ble_inited = false;
+}
+
+bool set_page_turn_ble(bool on) {
+    if (g_task_active) return false;
+    g_page_turn_ble = on;
+    cfg_save();
+    return true;
+}
+bool page_turn_ble() { return g_page_turn_ble; }
+
+bool set_page_turn_gear(int gear) {
+    if (g_task_active) return false;
+    if (gear < 0 || gear > 50) return false;
+    g_page_turn_gear = gear;
+    cfg_save();
+    return true;
+}
+int page_turn_gear() { return g_page_turn_gear; }
+
+bool set_page_turn_run_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 100 || ms > 600000) return false;
+    g_page_turn_run_ms = ms;
+    cfg_save();
+    return true;
+}
+int page_turn_run_ms() { return g_page_turn_run_ms; }
+
+// 地址只接受十六进制（可带冒号/短横），存成 12 位紧凑串；格式不对直接拒绝。
+bool set_ble_address(const std::string& addr) {
+    std::string hex;
+    for (char c : addr) {
+        if (c == ':' || c == '-' || c == ' ') continue;
+        const bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!isHex) return false;
+        hex.push_back(c);
+    }
+    if (hex.size() != 12) return false;
+    g_ble_addr = hex;
+    blem::set_address_hex(hex);
+    cfg_save();
+    return true;
+}
+std::string ble_address() { return g_ble_addr; }
+
+bool ble_available() {
+    if (!g_ble_inited) page_turn_install();
+    return blem::available();
+}
+
+std::string ble_status_line() {
+    if (!g_ble_inited) return std::string(blem::state_text());
+    std::string s = blem::state_text();
+    if (blem::state() == blem::St::Error) {
+        std::string e = blem::last_error();
+        if (!e.empty()) s += "：" + e;
+    }
+    return s;
+}
+
+bool ble_connect(std::string& err) {
+    if (!g_ble_inited) page_turn_install();
+    if (!blem::available()) { err = "本机 WinRT 蓝牙不可用"; return false; }
+    blem::set_address_hex(g_ble_addr);
+    blem::request_connect();
+    return true;
+}
+
+void ble_disconnect() {
+    if (g_ble_inited) blem::request_disconnect();
+}
+
+
 // 实时排版预览：不写审计；据当前文本重切页（文本未变的页保留拖拽坐标），
 // 返回【当前编辑页】的叠画字块与分页信息，供 GUI 书写页画布/翻页条即时刷新。
 json layout_preview(const std::string& utf8_text) {
@@ -1408,6 +1569,11 @@ bool cfg_save() {
     j["page_chars"]            = g_page_chars;
     j["page_count"]            = g_page_count;
     j["page_turn_wait_ms"]     = g_page_turn_wait_ms;
+    // —— 蓝牙翻页（2026-09-21）—— //
+    j["page_turn_ble"]         = g_page_turn_ble;
+    j["page_turn_gear"]        = g_page_turn_gear;
+    j["page_turn_run_ms"]      = g_page_turn_run_ms;
+    j["ble_addr"]              = g_ble_addr;
     j["page_text"]             = w_to_utf8(g_full_text);    // 实际书写子串（截断后）
     j["page_text_full"]        = w_to_utf8(g_full_all);     // 全量文本（容量恢复后不丢字）
     {
@@ -1516,6 +1682,29 @@ void cfg_load() {
         if (j.contains("page_turn_wait_ms") && j["page_turn_wait_ms"].is_number_integer()) {
             int v = j["page_turn_wait_ms"].get<int>();
             if (v >= 500 && v <= 60000) g_page_turn_wait_ms = v;
+        }
+        // —— 蓝牙翻页（2026-09-21）—— //
+        if (j.contains("page_turn_ble") && j["page_turn_ble"].is_boolean())
+            g_page_turn_ble = j["page_turn_ble"].get<bool>();
+        if (j.contains("page_turn_gear") && j["page_turn_gear"].is_number_integer()) {
+            int v = j["page_turn_gear"].get<int>();
+            if (v >= 0 && v <= 50) g_page_turn_gear = v;
+        }
+        if (j.contains("page_turn_run_ms") && j["page_turn_run_ms"].is_number_integer()) {
+            int v = j["page_turn_run_ms"].get<int>();
+            if (v >= 100 && v <= 600000) g_page_turn_run_ms = v;
+        }
+        if (j.contains("ble_addr") && j["ble_addr"].is_string()) {
+            std::string a = j["ble_addr"].get<std::string>();
+            std::string hex;
+            for (char c : a) {
+                if (c == ':' || c == '-' || c == ' ') continue;
+                const bool isHex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                                   (c >= 'A' && c <= 'F');
+                if (!isHex) { hex.clear(); break; }
+                hex.push_back(c);
+            }
+            if (hex.size() == 12) g_ble_addr = hex;
         }
         {
             auto parseCells = [](const json& arr) {

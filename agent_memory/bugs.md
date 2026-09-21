@@ -25,6 +25,25 @@
 | 方案已形成，待实测 | 尚不能确认控制器是否提供真实当前位置、状态、报警和限位寄存器 | 测量结果可信度 | 先确认寄存器映射；未知地址不得盲读 |
 | 方案已形成，待确认 | 自动拖纸机构可能被组委会视为额外执行机构 | 比赛合规性 | 赛前向组委会书面确认；固定纸张版作为保底 |
 
+## 蓝牙翻页接入的坑（2026-09-20/21，实测踩过；下次别再走弯路）
+
+| 状态 | 描述 | 影响范围 | 复现步骤 / 判据 |
+|------|------|----------|----------|
+| **已定位·环境问题** | **`OpenAsync` 返回 `GattOpenStatus_SharingViolation(4)` = 模块被别的程序占着**。BLE 外设同时只服务一个中心设备；被占用时它**停止广播**（`BleakScanner` 扫不到），但 Windows 仍按配对缓存回答 `ConnectionStatus=Connected`，极具迷惑性 | 蓝牙翻页全部功能 | `OpenAsync`/`GattCharacteristicsResult.Status=3(AccessDenied)`。查法：`tasklist` + PowerShell `Get-CimInstance Win32_Process` 看命令行。本次是用户自己的 `motor_ble_gui.py` 还开着 |
+| **已确认·不要再用** | **Win32 老 GATT API 收不了也发不了**：`BluetoothGATTGetServices/GetCharacteristics` 读**缓存**能成功，但 `BluetoothGATTSetCharacteristicValue` 与 `BluetoothGATTRegisterEvent` **一律立刻返回 E_FAIL(0x80070001)**。即使 WinRT 已把链路拉起（`ConnectionStatus=Connected`）也一样 —— 两套栈不能共用设备 | 任何走 Win32 GATT 的方案 | 纯 Win32 PoC 实测：服务/特征枚举 OK，订阅与写入 5 次重试全 E_FAIL、耗时 0ms |
+| **已确认·不要再用** | `BluetoothGATTGetServices/GetCharacteristics` 带 `BLUETOOTH_GATT_FLAG_FORCE_READ_FROM_DEVICE` 在本机返回 **E_INVALIDARG(0x80070057)** | Win32 GATT 路径 | 同上；改用 `BLUETOOTH_GATT_FLAG_NONE` 才成功（但写入仍失败，见上条） |
+| **已确认·必守** | **特征枚举必须 `GetCharacteristicsWithCacheModeAsync(Uncached)`**：服务缓存可能是冷的，`GetCharacteristicsAsync()` 直接返回 **0 个特征** | 找不到 FFE1 | 纯 WinRT 首版就是这样：`FFE0 下 0 个特征` |
+| **已确认·必守** | **只做 `RequestAccessAsync` 不够，必须再 `OpenAsync(GattSharingMode_SharedReadAndWrite)`**；且它的返回状态就是「模块现在能不能用」的直接判据 | 链路可用性 | `RequestAccess` 给 Allowed，但 `OpenAsync` 给 SharingViolation |
+| **已确认·必守** | MinGW g++ 里用 WinRT：`ITypedEventHandler<GattCharacteristic*, GattValueChangedEventArgs*>` 经 `AggregateType` 展开后，**`Invoke` 的实参是接口 `IGattCharacteristic*`/`IGattValueChangedEventArgs*`**，写成运行类**编译期 override 不上**（报 does not override） | 通知订阅（闭环回包） | 直接照 `ble_motor.cpp` 里的 `ValueChangedHandler` 抄 |
+| **已确认·必守** | `DEFINE_GUID` 未定义 `INITGUID` 时**只有声明没有实体** → `IID_IAsyncInfo`/`IID_IBufferByteAccess` 链接期 undefined。**自带 GUID 常量**最省事（见 `ble_motor.cpp`） | 链接 | `undefined reference to IID_IAsyncInfo` |
+| **已确认·必守** | MinGW 的 `windows.devices.bluetooth.h` **只前置声明 `IBluetoothLEDevice3`**（没定义），拿不到 `GetGattServicesAsync`。可用 `IBluetoothLEDevice::GetGattService(uuid,&svc)` + `get_GattServices()` 替代 | 服务枚举 | 编译期 `invalid use of incomplete type IBluetoothLEDevice3` |
+| **已修复 2026-09-21** | GUI 关闭时崩溃：`ble_motor` 的工作线程若是**可 join 的静态 `std::thread`**，静态销毁阶段会打 `terminate called without an active exception` 并崩溃 | 程序退出 | 改为 `detach()` + `g_started/g_workerDone` 显式收尾，并在 `WM_DESTROY` 调 `gs::page_turn_shutdown()`。正常关闭（`CloseMainWindow`）已实测干净退出 |
+| **非缺陷·勿误判** | `timeout N ./RobotGUI.exe` 被强杀时 stderr 会出现 `terminate called without an active exception` —— 这是**改动前就存在**的：`gui_win32.cpp` 的 `g_poll` 在消息循环期间是可 join 的。正常关闭路径会 `join()`，无此问题 | 仅强杀场景 | 用 `CloseMainWindow()` 复测即无 |
+
+**本机蓝牙模块事实（省得重新体检）**：模块自称 HC-05，**实为 BLE 模块**（固件 `hc05V2.3_le`），Windows **永远不建 COM 口**（SPP 实例 0 个，枚举在 `BTHLE\DEV_21F6473AD889`）；地址 **`21:F6:47:3A:D8:89`**；GATT 服务 **FFE0**，特征 **FFE1=0x0010(write+notify)** / FFE2=0x0013(write only)；**FFE1 不可读**（所以只能靠 notify 收回包）。PC 端一线通吃：Python 用 `bleak`，C++ 用本工程 `ble_motor.{h,cpp}`。
+
+**能耗提示**：`BluetoothLEDevice` 对象活着 = 链路活着，所以**建链一次后要常驻复用**（首次约十几秒，之后一次翻页只要几百毫秒）。翻页回调里已按此实现；断链后下次翻页会自动重连。
+
 ## 风险记录
 <!-- 格式：可能性 | 影响 | 描述 | 缓解措施 -->
 
@@ -104,3 +123,54 @@
 | 待上机 2026-09-20 | 翻页后软件位姿 `g_last_pose` 不变（坐标重合前提下成立）；真机拖纸后臂的**物理**位置未变但**纸**动了，故复用坐标正确——前提须真机验证拖纸机构不动臂、且臂在翻页时已抬笔到安全高度 | 翻页安全、多页衔接 | 真机空载两页：翻页瞬间观察臂是否抬笔、拖纸时笔尖是否蹭纸 |
 | 待接入 2026-09-20 | 翻页当前为**模拟等待**（`page_turn_wait_locked` 分片睡眠 `page_turn_wait_ms`），未接真实蓝牙模块。真实实现须在 `gui_win32.cpp::Run()` 锚点 `gs::set_page_turn_handler(真实信号+等完成回调)`；回调返回 false=翻页失败→任务 failed(page_turn) | 比赛真机翻页 | 蓝牙模块就绪后替换 handler；协议/超时/失败重试待定 |
 | 已验证(dryrun+单测) 2026-09-20 | 翻页等待期点停止/急停立即中止不翻页（用户选定安全语义）：`verify_pages` 7.4 设 60s 等待、进入翻页阶段后 abort，实测 <5s 退出、停在第 1 页、第 2 页不写、error=estop | 翻页期安全 | 见 verify_pages.cpp 7.4（临时文件已移出项目，存 workspace .bak） |
+
+## 蓝牙翻页闭环验收 —— 2026-09-20 深夜（状态码定因，勿再凭 OpenAsync 猜）
+| 状态 | 描述 | 影响范围 | 复现步骤 |
+|------|------|----------|----------|
+| **✓ 已闭环 2026-09-21**（2026-09-20 定因） | **真正原因是「模块在空口上不可达」＝模块没上电**——**9-21 用户上电后一次跑通，软件零改动**，定因得到验证。，不是软件、不是程序占用。三重证据：①`bleak` 主动扫描 14s / 25s 两次都扫不到它（只扫到 4 个无关设备）；②`poc_winrt.exe`：`RequestAccessAsync=Allowed`、`OpenAsync status=1 Success`，但每次特征枚举耗 **7.75 s** 且 `GattCommunicationStatus=1 Unreachable`；③`ble_selftest.exe` 诊断 `[link=0 open=1 comm=1 n=0]`，`link=0` 即 `ConnectionStatus=Disconnected`（排除“幽灵链路”）。另：主板**未接本机**（无任何串口设备）。 | 翻页真机验收 | 给模块上电后先跑 `tmp/ble_poc/scan.py`，目标应出现在列表里 |
+| 已修 2026-09-20 | `ble_motor.cpp` 原先把 `Unreachable` 笼统报成“找不到 FFE1 特征（模块未就绪或服务未广播）”，**把排查方向带偏（往“服务没广播”查，实际是没上电）**。现按 `GattCommunicationStatus` 分诊并在信息里附 `[link= open= comm= n=]`。 | 故障定位效率 | 看 `ble_motor.cpp` `wr_open()` 尾部；跑 `ble_selftest.exe` 即可见 |
+| 误判留档 2026-09-20 | **不要只看 `OpenAsync` 就下结论**：它可能从本地缓存返回 `Success`，而空口根本没连上（本次就发生过）。必须同时看 `link`（ConnectionStatus）与 `comm`（GattCommunicationStatus）。 | 排查方法 | — |
+| 环境提醒 2026-09-20 | 本机 `bleak` 3.0.2 **只装在系统 Python**（`C:\Users\zby\AppData\Local\Programs\Python\Python313\python.exe`），WorkBuddy 隔离 venv 里没有 → 跑 `scan.py`/`ref_bleak.py` 要用系统解释器。 | 参照测试 | `pip list` 查 `bleak` |
+
+## 蓝牙翻页验收通过留档 —— 2026-09-21
+| 状态 | 描述 | 影响范围 | 复现步骤 |
+|------|------|----------|----------|
+| ✓ 已通过 2026-09-21 | 真机闭环：`scan.py` 15s 扫到 `21:F6:47:3A:D8:89 rssi=-65 HC-05`；`ble_selftest.exe` → 建链 **2.30 s** → 发 `RUN30,3000` → **3.33 s** 收到 `DONE 30 3000`，EXIT=0。 | 翻页真信号链路 | 模块上电后跑 `tmp/ble_poc/ble_selftest.exe` |
+| 判据留档 | **可达时建链约 2.3 s；不可达时约 25 s 才报错**（`comm=1 Unreachable`）。两条时间量级差 10 倍，可当作「模块在不在」的快速旁证。 | 快速排障 | 对比 `ble_selftest.exe` 的 `[2]` 耗时 |
+
+## 蓝牙「扫描假阴性」——模块已被 Windows 攥住链路（2026-09-21 晚，实锤）
+
+| 状态 | 描述 | 影响范围 | 复现步骤 / 判据 |
+|------|------|----------|----------|
+| **已定位·判据修正** | 模块**与 PC 已配对**（`HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices` 下有 `21f6473ad889` 链接密钥记录）。对已配对的 BLE 设备 **Windows 会常驻保持 LE 链路**；而 BLE 外设**一旦被连上就停止广播** → **`BleakScanner` 扫不到、bleak 按地址连报 `DeviceNotFound(30s)`，可 WinRT 按地址 0.06s 拿到设备、0.36s 枚举完 GATT、写特征与收通知全部正常、电机真转。** | 「判模块在不在」的全部诊断 | 跑 `tmp/ble_poc/winrt_probe.py`：应见 `connection_status = Connected (1)`、`name='HC-05'`、Uncached 服务 3 个（1800/1801/FFE0） |
+| **判据（背下来）** | **扫描阳性 ⇒ 可信；扫描阴性 ⇒ 不可信。** 决定性判据是「能否拿到设备对象 / 建链多快」：拿到 = 在（`Connected`/`Disconnected` **都算在**）；返回 `null` = 不在。建链耗时：链路已存在 **0.1~0.6s** ／ 刚在广播 **2~3s** ／ 不在 **空等 25s**。 | 排障 | 见上 |
+| **纠正 2026-09-20 的结论** | 当时把「`scan.py` 扫不到 ⇒ 模块没上电」当成定论并写进了技能与清单。**9-21 晚出现真实反例**：扫不到，但 WinRT 直连 **0.56s** 就跑通闭环。→「扫不到」只能说明**空口上没在广播**，**不能**推断不在。 | 方法论 | 对比本节与上一节 |
+| **想恢复广播** | Windows「设置 → 蓝牙和其他设备」里把 `HC-05X` **删除设备**（取消配对）→ 立刻恢复广播；或给模块断电重启（只那次有效，之后还会被重新连上）。 | 手机 App 要连它时 | — |
+| **非缺陷·须知晓** | **`g_dryRun` 管不到翻页**：翻页走 BLE，不是串口。所以「Dry Run + 勾蓝牙翻页」= 机械臂不动、**电机真转**。 | Dry Run 语义 | 勾 Dry Run + 勾蓝牙翻页，写两页 → 电机转 3s |
+
+- 新增工具：`tmp/ble_poc/winrt_probe.py`（Python `winrt-*` 直读链路状态，**不发运动指令**）。
+- 注：该枚举 `GattCacheMode` 在 Python 投影里没导出名字，`get_gatt_services_with_cache_mode_async` 直接传数值 **1**（=Uncached）。
+- 本机 `bleak` 3.0.2 装在系统 Python，`winrt-*` 是它的依赖 → 因此系统 Python 里也能直接调 WinRT。
+## UI 子控件跨页残留：按钮「跑到别的页上」（2026-09-21 晚 已修）
+
+| 状态 | 描述 | 影响范围 | 复现步骤 |
+|---|---|---|---|
+| **已修** | `MakeBtn()` 用 `g_btns[64]`（下标 = 控件ID − 1000，且有 `slot < 64` 判断）登记按钮句柄，`DestroyPageControls()` 只销毁这个数组里的句柄。**ID 一旦 ≥ 1064 就登记不上 → 永远销毁不掉**。当前枚举里 `IDC_BTN_PAGE_NEXT = 1064`（▶ 下一页）、`IDC_BTN_BLECONN = 1067`（连接蓝牙）正好越界。 | 全部页面：这两个按钮会盖在其它页面上（用户看到的「按键错位、出现在不该出现的页」） | 打开 GUI → 进「书写任务」→ 切到「主页 / 设备连接 / 书写平面」→ ▶ 与「连接蓝牙」仍在原坐标；**每次切页还会再攒一对**（旧进程实测主页从 33→49→51 个直接子控件） |
+
+判据（跨进程实测，`tmp/ble_poc/probe_children.exe` 枚举直接子控件）：
+
+| 页面 | 旧版子控件数 | 修好后 |
+|---|---|---|
+| 主页 | 49 → 51（越切越多） | **19** |
+| 设备连接 | 35 | **5** |
+| 书写任务 | 63 → 65 | **35** |
+| 书写平面 | 33 | **3** |
+
+修法（`gui_win32.cpp`）：
+- 删掉 `g_btns[64]` 记账，`DestroyPageControls(HWND)` 改为**枚举主窗口的直接子窗口并全部销毁**（先收集再销毁；只取直接子窗口，不递归以免动到 COMBOBOX 内部的编辑框/列表框）。新增控件自动覆盖，不会再漏。
+- 顺带修 `DrawBtn()` 里同源的 `slot < 64` 判断：它让 `IDC_BTN_BLECONN` 跳过整个 switch、拿到默认 BLUE 而不是 TEAL。
+- 顺带按**实测字宽**修「蓝牙翻页」行尺寸：`连接蓝牙` 需要 80px，原按钮只有 70px → 被 `DT_END_ELLIPSIS` 截成「连接…」；`档位(0~50)：` 需 115px（原 56）、`时长(ms)：` 需 95px（原 86）也都在截断。
+
+### ★探针工具的两个必知坑（下次别再踩）
+1. **探针必须 `SetProcessDPIAware()`**：本程序调了 `SetProcessDPIAware()`，窗口坐标是物理像素；DPI 不感知的探针拿到的坐标会被 Windows 虚拟化（本机实测缩到 **2/3**），不仅位置偏小，**模拟点击还会落到错位的导航项上**，把「没残留」误判成「有残留」。
+2. **控制台打印中文会乱码**：探针结果写 UTF-8 文件再读，别指望 stdout。

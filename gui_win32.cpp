@@ -185,6 +185,7 @@ enum {
     IDC_BTN_SPEED_DEC, IDC_BTN_SPEED_INC, IDC_EDIT_SPACING, IDC_BTN_SPACING_APPLY,
     IDC_BTN_ZOFF_APPLY, IDC_EDIT_ZOFF,
     IDC_CHECK_DRY, IDC_CHECK_AUTODRAW, IDC_CHECK_HQ, IDC_CHECK_DIP, IDC_CHECK_LOG, IDC_CHECK_DUNBI,
+    IDC_CHECK_BLE,                    // ★蓝牙翻页开关（必须紧邻上面的 CHECK 块：按 id-IDC_CHECK_DRY 索引）
     IDC_EDIT_PREVIEW,
     IDC_EDIT_C0X, IDC_EDIT_C0Y, IDC_EDIT_C1X, IDC_EDIT_C1Y,
     IDC_EDIT_C2X, IDC_EDIT_C2Y, IDC_EDIT_C3X, IDC_EDIT_C3Y,
@@ -196,6 +197,7 @@ enum {
     IDC_BTN_LAY_APPLY, IDC_BTN_LAY_AUTO, IDC_CHECK_VERT,
     IDC_COMBO_ORIENT, IDC_BTN_RESETCANVAS,
     IDC_EDIT_PAGECH, IDC_EDIT_PGCNT, IDC_EDIT_TURNWAIT, IDC_BTN_PAGE_PREV, IDC_BTN_PAGE_NEXT,
+    IDC_EDIT_TURNGEAR, IDC_EDIT_TURNRUN, IDC_BTN_BLECONN,   // ★蓝牙翻页：档位 / 时长 / 连接
     ID_PAGE_HOME = 2001, ID_PAGE_CONNECT, ID_PAGE_WRITE, ID_PAGE_PLANE,
     IDT_TIMER = 3001,
 };
@@ -222,7 +224,6 @@ static HWND g_editSpacing = nullptr;
 static HWND g_editZoff = nullptr;
 static HWND g_editPreview = nullptr;
 static HWND g_editPlaneZ = nullptr;      // 书写平面页：新 Z 输入框
-static HWND g_btns[64] = {};            // ID 映射辅助
 static HWND g_checks[16] = {};
 static HWND g_cornerEdits[8] = {};      // 四角标定输入：[i*2]=角i X，[i*2+1]=角i Y
 
@@ -232,6 +233,8 @@ static HWND g_comboOrient  = nullptr;   // 书写方向（字体朝向）下拉�
 static HWND g_editPageCh   = nullptr;   // 每页字数输入框
 static HWND g_editPgCnt    = nullptr;   // 总页数输入框
 static HWND g_editTurnWait = nullptr;   // 翻页模拟等待 ms 输入框（轨迹面板翻页条内）
+static HWND g_editTurnGear = nullptr;   // ★蓝牙翻页：档位输入框 0~50
+static HWND g_editTurnRun  = nullptr;   // ★蓝牙翻页：每次转动时长 ms
 static HWND g_stcTrunc     = nullptr;   // 截断提示文本（超容量时显示）
 // 分页缓存（UI 线程；RefreshLayoutPreview 更新）：编辑页/总页数/本次要写页数/页内是否有字
 static int  g_pgEdit = 0, g_pgTotal = 0, g_pgWritten = 0;
@@ -528,6 +531,13 @@ struct WritePlot {
     RECT btnPrev, btnNext;      // ◀ ▶ 按钮
     int pgLabX, pgLabW;         // “第 k/N 页”文本区
     int waitLabX, waitLabW, waitEdX, waitEdW;   // 翻页等待标签 + 输入框
+    // ★蓝牙翻页第二行（2026-09-21）：[✓蓝牙翻页] 档位：[ ] 时长(ms)：[ ] [连接] 状态文本
+    RECT strip2;
+    int  bleChkX, bleChkW;
+    int  gearLabX, gearLabW, gearEdX, gearEdW;
+    int  runLabX,  runLabW,  runEdX,  runEdW;
+    RECT bleBtn;
+    int  bleStX, bleStW;
     RECT plot;                  // 绘图区
 };
 
@@ -567,7 +577,23 @@ static WritePlot WritePlotGeo(const RECT& rc) {
     p.btnNext = RECT{ p.pgLabX + p.pgLabW + 8, p.strip.top + 2, p.pgLabX + p.pgLabW + 38, p.strip.top + 26 };
     p.waitLabX = p.btnNext.right + 24; p.waitLabW = 150;
     p.waitEdX = p.waitLabX + p.waitLabW; p.waitEdW = 64;
-    p.ctrlTop = p.strip.bottom + 6;
+    // ★蓝牙翻页第二行（2026-09-21）。整行下移，避免盖住下面的四角标定区。
+    p.strip2 = RECT{ p.x + pad, p.strip.bottom + 2, p.x + p.w - pad, p.strip.bottom + 30 };
+    {
+        const int ty = p.strip2.top;
+        // 宽度按实测字宽定（见 tmp/measure_text.cpp 的量测结果），避免标签被省略成「…」：
+        //   「蓝牙翻页」72px(18px字) / 「档位(0~50)：」115px / 「时长(ms)：」95px / 「连接蓝牙」80px(20px粗体)
+        p.bleChkX = p.strip2.left;             p.bleChkW = 108;   // 复选框：72 + 勾选框
+        p.gearLabX = p.bleChkX + p.bleChkW + 12; p.gearLabW = 118;  // 「档位(0~50)：」= 115
+        p.gearEdX  = p.gearLabX + p.gearLabW;    p.gearEdW  = 54;
+        p.runLabX  = p.gearEdX + p.gearEdW + 14; p.runLabW  = 98;   // 「时长(ms)：」= 95
+        p.runEdX   = p.runLabX + p.runLabW;      p.runEdW   = 76;
+        p.bleBtn   = RECT{ p.runEdX + p.runEdW + 14, ty, p.runEdX + p.runEdW + 118, ty + 25 };
+        //   ↑「连接蓝牙」需要 80px 文字宽，原宽度只有 70px → 显示成「连接…」
+        p.bleStX   = p.bleBtn.right + 14;
+        p.bleStW   = p.strip2.right - p.bleStX;  if (p.bleStW < 60) p.bleStW = 60;
+    }
+    p.ctrlTop = p.strip2.bottom + 6;
     for (int i = 0; i < 4; ++i) {
         int col = i % 2, row = i / 2;
         p.grpX[i] = p.x + pad + col * colSpan;
@@ -677,6 +703,17 @@ static void DrawTrailPanel(HDC dc, const WritePlot& p) {
             pg = L"输入文字后分页";
         Text(dc, pg, p.pgLabX, p.strip.top, p.pgLabW, 26, g_pgPartial && !act ? WARN : INK, 16, true);
         Text(dc, L"翻页等待(ms)：", p.waitLabX, p.strip.top, p.waitLabW, 26, MUTED, 14, true);
+        // ★蓝牙翻页第二行：此处只画标签与状态文本（复选框/输入框/按钮均为子控件）
+        Text(dc, L"档位(0~50)：", p.gearLabX, p.strip2.top, p.gearLabW, 26, MUTED, 14, true);
+        Text(dc, L"时长(ms)：",   p.runLabX,  p.strip2.top, p.runLabW,  26, MUTED, 14, true);
+        {
+            std::string bs = snapS("cfg", "ble_state");
+            std::string line = bs;
+            if (gs::page_turn_ble()) line += "（蓝牙翻页已启用）";
+            const bool bad = (bs.compare(0, 6, "异常") == 0);
+            Text(dc, to_ws(line), p.bleStX, p.strip2.top, p.bleStW, 26,
+                 bad ? DANGER : (gs::page_turn_ble() ? TEAL : MUTED), 14, true);
+        }
         // ◀ ▶ 为 owner-draw 按钮子窗口（CreateWriteControls），此处不画
     }
     for (int i = 0; i < 4; ++i) {
@@ -990,17 +1027,19 @@ static void MakeBtn(HWND parent, const BtnDef& d, int x, int y, int w, int h) {
     HWND b = CreateWindowW(L"BUTTON", d.text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
                            x, y, w, h, parent, (HMENU)(INT_PTR)d.id, nullptr, nullptr);
     SendMessage(b, WM_SETFONT, (WPARAM)g_fontBold20, TRUE);
-    int slot = d.id - 1000;
-    if (slot >= 0 && slot < 64) g_btns[slot] = b;
+    // 无需登记句柄：DestroyPageControls() 直接枚举并销毁主窗口的全部子控件。
 }
 
 // owner-draw：圆角实底色按钮（对应 HTML .button）
 static void DrawBtn(LPDRAWITEMSTRUCT di) {
-    int slot = (int)(UINT_PTR)GetDlgCtrlID(di->hwndItem) - 1000;
     COLORREF base = BLUE;
-    if (slot >= 0 && slot < 64) {
+    {
+        // 直接按控件 ID 选底色。
+        // （原先外面套了 slot(=id-1000) < 64 的判断，ID 较大的「连接蓝牙」
+        //   会跳过整个 switch、拿到默认 BLUE 而不是 TEAL —— 2026-09-21 修）
         switch (GetDlgCtrlID(di->hwndItem)) {
         case IDC_BTN_TESTPT: case IDC_BTN_CONNECT: case IDC_BTN_WRITE: case IDC_BTN_PLANE_PREVIEW:
+        case IDC_BTN_BLECONN:
         case IDC_BTN_CPREV0: case IDC_BTN_CPREV1: case IDC_BTN_CPREV2: case IDC_BTN_CPREV3: base = TEAL; break;
         case IDC_BTN_ESTOP: case IDC_BTN_STOP: base = DANGER; break;
         case IDC_BTN_DISCONNECT: case IDC_BTN_RESET: case IDC_BTN_CENTER:
@@ -1084,22 +1123,37 @@ static void OnPaint(HWND hwnd) {
 }
 
 // ---------------- 子控件创建（每页切换重建） ----------------
-static void DestroyPageControls() {
-    for (auto& b : g_btns) if (b) { DestroyWindow(b); b = nullptr; }
-    for (auto& c : g_checks) if (c) { DestroyWindow(c); c = nullptr; }
-    if (g_comboPort) { DestroyWindow(g_comboPort); g_comboPort = nullptr; }
-    if (g_editText) { DestroyWindow(g_editText); g_editText = nullptr; }
-    if (g_editSpacing) { DestroyWindow(g_editSpacing); g_editSpacing = nullptr; }
-    if (g_editZoff) { DestroyWindow(g_editZoff); g_editZoff = nullptr; }
-    if (g_editPreview) { DestroyWindow(g_editPreview); g_editPreview = nullptr; }
-    if (g_editPlaneZ) { DestroyWindow(g_editPlaneZ); g_editPlaneZ = nullptr; }
-    for (auto& e : g_cornerEdits) if (e) { DestroyWindow(e); e = nullptr; }
-    if (g_editCharSize) { DestroyWindow(g_editCharSize); g_editCharSize = nullptr; }
-    if (g_comboOrient) { DestroyWindow(g_comboOrient); g_comboOrient = nullptr; }
-    if (g_editPageCh) { DestroyWindow(g_editPageCh); g_editPageCh = nullptr; }
-    if (g_editPgCnt) { DestroyWindow(g_editPgCnt); g_editPgCnt = nullptr; }
-    if (g_editTurnWait) { DestroyWindow(g_editTurnWait); g_editTurnWait = nullptr; }
-    if (g_stcTrunc) { DestroyWindow(g_stcTrunc); g_stcTrunc = nullptr; }
+// ★销毁当前页的全部子控件。
+//   2026-09-21 修：旧实现靠 g_btns[64]（下标 = 控件ID - 1000）登记按钮句柄，
+//   按钮 ID 一旦超过 1063 就越界、登记失败 → IDC_BTN_PAGE_NEXT(1064) 与
+//   IDC_BTN_BLECONN(1067) 永远销毁不掉，切换页面后残留、错位在别的页上。
+//   现在改为「枚举主窗口的直接子窗口并全部销毁」，新增控件自动覆盖，不会再漏。
+static void DestroyPageControls(HWND hwnd) {
+    // 先收集再销毁：边枚举边销毁会让 HWND 链表失效。只取直接子窗口，
+    // 不递归（避免动到 COMBOBOX 内部的编辑框/列表框）。
+    std::vector<HWND> kids;
+    for (HWND c = GetWindow(hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+        kids.push_back(c);
+    for (HWND c : kids) DestroyWindow(c);
+
+    // 句柄清零。控件已在上面销毁，这里只清指针，避免留下悬空句柄。
+    // ⚠ 以后新增子控件，必须在这里补一行清零。
+    for (auto& c : g_checks) c = nullptr;
+    for (auto& e : g_cornerEdits) e = nullptr;
+    g_comboPort = nullptr;
+    g_editText = nullptr;
+    g_editSpacing = nullptr;
+    g_editZoff = nullptr;
+    g_editPreview = nullptr;
+    g_editPlaneZ = nullptr;
+    g_editCharSize = nullptr;
+    g_comboOrient = nullptr;
+    g_editPageCh = nullptr;
+    g_editPgCnt = nullptr;
+    g_editTurnWait = nullptr;
+    g_editTurnGear = nullptr;
+    g_editTurnRun = nullptr;
+    g_stcTrunc = nullptr;
     g_pgEdit = 0; g_pgTotal = 0; g_pgWritten = 0; g_pgPartial = true;
     g_prevCells.clear(); g_prevValid = false;
     g_dragging = false; g_dragIdx = -1;
@@ -1304,6 +1358,29 @@ static void CreateWriteControls(HWND hwnd) {
                                      (HMENU)(INT_PTR)IDC_EDIT_TURNWAIT, nullptr, nullptr);
     SendMessage(g_editTurnWait, WM_SETFONT, (WPARAM)g_font16, TRUE);
     SetWindowTextW(g_editTurnWait, std::to_wstring(snapI("cfg", "page_turn_wait_ms", 3000)).c_str());
+
+    // ★蓝牙翻页第二行控件（2026-09-21）：开关 / 档位 / 时长 / 连接按钮
+    {
+        HWND chk = MakeCheck(hwnd, IDC_CHECK_BLE, L"蓝牙翻页", wp.bleChkX, wp.strip2.top, wp.bleChkW, 24);
+        SendMessage(chk, BM_SETCHECK, snapB("cfg", "page_turn_ble") ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        g_editTurnGear = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                         wp.gearEdX, wp.strip2.top, wp.gearEdW, 24, hwnd,
+                                         (HMENU)(INT_PTR)IDC_EDIT_TURNGEAR, nullptr, nullptr);
+        SendMessage(g_editTurnGear, WM_SETFONT, (WPARAM)g_font16, TRUE);
+        SetWindowTextW(g_editTurnGear, std::to_wstring(snapI("cfg", "page_turn_gear", 30)).c_str());
+
+        g_editTurnRun = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                        wp.runEdX, wp.strip2.top, wp.runEdW, 24, hwnd,
+                                        (HMENU)(INT_PTR)IDC_EDIT_TURNRUN, nullptr, nullptr);
+        SendMessage(g_editTurnRun, WM_SETFONT, (WPARAM)g_font16, TRUE);
+        SetWindowTextW(g_editTurnRun, std::to_wstring(snapI("cfg", "page_turn_run_ms", 3000)).c_str());
+
+        MakeBtn(hwnd, { L"连接蓝牙", IDC_BTN_BLECONN, TEAL },
+                wp.bleBtn.left, wp.bleBtn.top, wp.bleBtn.right - wp.bleBtn.left, wp.bleBtn.bottom - wp.bleBtn.top);
+    }
 
     RefreshLayoutPreview();   // 初次生成排版预览
 }
@@ -1668,6 +1745,28 @@ static void OnCommand(HWND hwnd, int id, HWND ctl, int code) {
         gs::set_log_enable(SendMessage(g_checks[id - IDC_CHECK_DRY], BM_GETCHECK, 0, 0) == BST_CHECKED);
         SetResult(L"运行日志开关已切换。");
         break;
+    // ★蓝牙翻页开关
+    case IDC_CHECK_BLE: {
+        bool on = (SendMessage(g_checks[id - IDC_CHECK_DRY], BM_GETCHECK, 0, 0) == BST_CHECKED);
+        if (!gs::set_page_turn_ble(on)) {
+            SendMessage(g_checks[id - IDC_CHECK_DRY], BM_SETCHECK, on ? BST_UNCHECKED : BST_CHECKED, 0);
+            SetResult(L"任务运行中，不能切换蓝牙翻页。", true);
+        } else if (on) {
+            SetResult(L"蓝牙翻页已启用：每页写完会发 RUN<档位>,<时长> 给板子并等 DONE 回包。");
+        } else {
+            SetResult(L"蓝牙翻页已停用：翻页回退为模拟等待。");
+        }
+        break;
+    }
+    // ★蓝牙连接按钮（非阻塞发起；状态显示在翻页条右侧）
+    case IDC_BTN_BLECONN: {
+        std::string err;
+        if (!gs::ble_available()) { SetResult(L"本机 WinRT 蓝牙不可用。", true); break; }
+        if (!gs::ble_connect(err)) { SetResult(fmt(L"发起连接失败：%s", to_ws(err).c_str()), true); break; }
+        SetResult(fmt(L"正在连接蓝牙 %s …（约十几秒，请勿重复点击）",
+                      to_ws(gs::ble_address()).c_str()));
+        break;
+    }
     case IDC_BTN_CCLEAR:
         gs::clear_corners();
         for (int i = 0; i < 8; ++i) if (g_cornerEdits[i]) SetWindowTextW(g_cornerEdits[i], L"");
@@ -1749,6 +1848,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_checks[2]) SendMessage(g_checks[2], BM_SETCHECK, snapB("cfg", "high_quality") ? BST_CHECKED : BST_UNCHECKED, 0);
                 if (g_checks[3]) SendMessage(g_checks[3], BM_SETCHECK, snapB("cfg", "enable_dip") ? BST_CHECKED : BST_UNCHECKED, 0);
                 if (g_checks[5]) SendMessage(g_checks[5], BM_SETCHECK, snapB("cfg", "enable_dunbi") ? BST_CHECKED : BST_UNCHECKED, 0);
+                if (g_checks[6]) SendMessage(g_checks[6], BM_SETCHECK, snapB("cfg", "page_turn_ble") ? BST_CHECKED : BST_UNCHECKED, 0);
                 RefreshLayoutPreview();   // 任务结束：刷新分页缓存/状态框（画布仍按轨迹门控显示叠画与否）
             }
             s_lastTask = act;
@@ -1770,6 +1870,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (code == EN_CHANGE && ctl == g_editPgCnt)   { ApplyIntField(g_editPgCnt, gs::set_page_count, 1, 20); RefreshLayoutPreview(); return 0; }
             if (code == EN_KILLFOCUS && ctl == g_editPgCnt) { CommitIntField(g_editPgCnt, gs::set_page_count, 1, 20, L"总页数"); RefreshLayoutPreview(); return 0; }
             if (code == EN_KILLFOCUS && ctl == g_editTurnWait) { CommitIntField(g_editTurnWait, gs::set_page_turn_wait_ms, 500, 60000, L"翻页等待(ms)"); return 0; }
+            // ★蓝牙翻页参数（档位 / 转动时长）：与上面同款两段式套用
+            if (code == EN_CHANGE && ctl == g_editTurnGear) { ApplyIntField(g_editTurnGear, gs::set_page_turn_gear, 0, 50); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editTurnGear) { CommitIntField(g_editTurnGear, gs::set_page_turn_gear, 0, 50, L"档位"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editTurnRun) { ApplyIntField(g_editTurnRun, gs::set_page_turn_run_ms, 100, 600000); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editTurnRun) { CommitIntField(g_editTurnRun, gs::set_page_turn_run_ms, 100, 600000, L"转动时长(ms)"); return 0; }
             if (code == CBN_SELCHANGE && id == IDC_COMBO_ORIENT) {
                 int sel = (int)SendMessageW(g_comboOrient, CB_GETCURSEL, 0, 0);
                 if (gs::task_active()) {
@@ -1801,7 +1906,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int np = NAV[idx].id;
                 if (np != g_st.page) {
                     g_st.page = np;
-                    DestroyPageControls();
+                    DestroyPageControls(hwnd);
                     if (np == ID_PAGE_HOME) CreateHomeControls(hwnd);
                     else if (np == ID_PAGE_CONNECT) CreateConnectControls(hwnd);
                     else if (np == ID_PAGE_WRITE) CreateWriteControls(hwnd);
@@ -1865,7 +1970,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         // 窗口尺寸变化：重建当前页控件，保持布局与绘制一致
         if (g_st.hwnd) {
-            DestroyPageControls();
+            DestroyPageControls(hwnd);
             if (g_st.page == ID_PAGE_HOME) CreateHomeControls(hwnd);
             else if (g_st.page == ID_PAGE_CONNECT) CreateConnectControls(hwnd);
             else if (g_st.page == ID_PAGE_WRITE) CreateWriteControls(hwnd);
@@ -1882,6 +1987,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_DESTROY:
         KillTimer(hwnd, IDT_TIMER);
+        gs::page_turn_shutdown();   // ★退出前断开蓝牙并停掉 BLE 工作线程（避免崩溃/占用残留）
         PostQuitMessage(0);
         return 0;
     }
@@ -1896,9 +2002,11 @@ int Run() {
 
     // 初始化服务层：GUI 来源 = HUMAN
     gs::set_source("GUI", "HUMAN");
-    // ★翻页蓝牙模块预留锚点：接入时在此 gs::set_page_turn_handler(真实信号实现)；
-    //   未注入则服务层用 page_turn_wait_ms 模拟等待（任务线程内分片可被停止/急停打断）。
+    // ★翻页蓝牙模块（2026-09-21 接入）：先载配置，再注册真实信号回调。
+    //   回调内做「确保链路 → 发 RUN<档位>,<时长> → 等板子回 DONE」闭合环；
+    //   开关关闭时自动回退到 page_turn_wait_ms 模拟等待（原行为不变）。
     gs::cfg_load();
+    gs::page_turn_install();
     g_st.snap = gs::snapshot();
 
     g_brPanel = CreateSolidBrush(WHITE);
