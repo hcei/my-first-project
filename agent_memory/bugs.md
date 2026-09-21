@@ -127,7 +127,13 @@
 ## 蓝牙翻页闭环验收 —— 2026-09-20 深夜（状态码定因，勿再凭 OpenAsync 猜）
 | 状态 | 描述 | 影响范围 | 复现步骤 |
 |------|------|----------|----------|
-| 已定因 2026-09-20 | **验收失败的真正原因是「模块在空口上不可达」＝模块没上电（或正被手机占着）**，不是软件、不是程序占用。三重证据：①`bleak` 主动扫描 14s / 25s 两次都扫不到它（只扫到 4 个无关设备）；②`poc_winrt.exe`：`RequestAccessAsync=Allowed`、`OpenAsync status=1 Success`，但每次特征枚举耗 **7.75 s** 且 `GattCommunicationStatus=1 Unreachable`；③`ble_selftest.exe` 诊断 `[link=0 open=1 comm=1 n=0]`，`link=0` 即 `ConnectionStatus=Disconnected`（排除“幽灵链路”）。另：主板**未接本机**（无任何串口设备）。 | 翻页真机验收 | 给模块上电后先跑 `tmp/ble_poc/scan.py`，目标应出现在列表里 |
+| **✓ 已闭环 2026-09-21**（2026-09-20 定因） | **真正原因是「模块在空口上不可达」＝模块没上电**——**9-21 用户上电后一次跑通，软件零改动**，定因得到验证。，不是软件、不是程序占用。三重证据：①`bleak` 主动扫描 14s / 25s 两次都扫不到它（只扫到 4 个无关设备）；②`poc_winrt.exe`：`RequestAccessAsync=Allowed`、`OpenAsync status=1 Success`，但每次特征枚举耗 **7.75 s** 且 `GattCommunicationStatus=1 Unreachable`；③`ble_selftest.exe` 诊断 `[link=0 open=1 comm=1 n=0]`，`link=0` 即 `ConnectionStatus=Disconnected`（排除“幽灵链路”）。另：主板**未接本机**（无任何串口设备）。 | 翻页真机验收 | 给模块上电后先跑 `tmp/ble_poc/scan.py`，目标应出现在列表里 |
 | 已修 2026-09-20 | `ble_motor.cpp` 原先把 `Unreachable` 笼统报成“找不到 FFE1 特征（模块未就绪或服务未广播）”，**把排查方向带偏（往“服务没广播”查，实际是没上电）**。现按 `GattCommunicationStatus` 分诊并在信息里附 `[link= open= comm= n=]`。 | 故障定位效率 | 看 `ble_motor.cpp` `wr_open()` 尾部；跑 `ble_selftest.exe` 即可见 |
 | 误判留档 2026-09-20 | **不要只看 `OpenAsync` 就下结论**：它可能从本地缓存返回 `Success`，而空口根本没连上（本次就发生过）。必须同时看 `link`（ConnectionStatus）与 `comm`（GattCommunicationStatus）。 | 排查方法 | — |
 | 环境提醒 2026-09-20 | 本机 `bleak` 3.0.2 **只装在系统 Python**（`C:\Users\zby\AppData\Local\Programs\Python\Python313\python.exe`），WorkBuddy 隔离 venv 里没有 → 跑 `scan.py`/`ref_bleak.py` 要用系统解释器。 | 参照测试 | `pip list` 查 `bleak` |
+
+## 蓝牙翻页验收通过留档 —— 2026-09-21
+| 状态 | 描述 | 影响范围 | 复现步骤 |
+|------|------|----------|----------|
+| ✓ 已通过 2026-09-21 | 真机闭环：`scan.py` 15s 扫到 `21:F6:47:3A:D8:89 rssi=-65 HC-05`；`ble_selftest.exe` → 建链 **2.30 s** → 发 `RUN30,3000` → **3.33 s** 收到 `DONE 30 3000`，EXIT=0。 | 翻页真信号链路 | 模块上电后跑 `tmp/ble_poc/ble_selftest.exe` |
+| 判据留档 | **可达时建链约 2.3 s；不可达时约 25 s 才报错**（`comm=1 Unreachable`）。两条时间量级差 10 倍，可当作「模块在不在」的快速旁证。 | 快速排障 | 对比 `ble_selftest.exe` 的 `[2]` 耗时 |
