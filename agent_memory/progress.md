@@ -33,6 +33,7 @@
 - 上一轮 Win32 GUI 已完成，本轮不动既有三页布局。
 
 ## 下一步 / 待办（新增或承接）
+- **★ 2026-09-21 晚·BLE 判据修正（先读这条）**：`tmp/ble_poc/winrt_probe.py` 实测模块 **`connection_status = Connected (1)`** —— 模块**与 PC 已配对、Windows 常驻持着链路** → 它**不广播** → `scan.py`/bleak **必然扫不到（假阴性）**，而 WinRT 按地址访问是 0.1s 级。**「扫不到」不等于「模块不在」**（9-20 的结论已纠正，详见 `bugs.md` 末节）。CLI 闭环复测通过：建链 **0.56 s** → `DONE 30 3000`。
 - **蓝牙翻页：GUI 整任务验收（只剩这一步）**：`ble_selftest.exe` 闭环已通过（见上）。接下来在 `RobotGUI.exe` 里做**整任务**验收：书写任务页 → 翻页条第二行勾「蓝牙翻页」、档位 `30`、时长 `3000` → 点「连接蓝牙」（应显示已连接）→ 写两页内容 → 开始书写，观察第 1 页写完**电机转** → 抬笔 → 清轨迹 → 写第 2 页。细节见 workspace `电机代码\电脑端蓝牙控制工具\蓝牙翻页验收清单.md`。
 - 翻页档位/时长的**手感标定**：默认 30 档 / 3000ms 只是可跑通的起点，需按真实走纸机构的走纸量与速度微调（GUI 上直接改即可，会自动存进 `robot_config.json`）。
 - **注**：`motor_ble_gui.py` 与本工程现在**抢同一个模块**，两者不要同时用。
@@ -146,3 +147,5 @@
 - 已知环境限制：`Robot.exe` 交互式写字需约 8 分钟（单字 3749 点 DRYRUN），本轮以 5 分钟窗口截取前段对比；控制台 stdin 重定向在 EOF 后不退出，需显式输入菜单 4。
 - 已知环境限制：本机 `CopyFromScreen` 截图会返回冻结帧，核验必须“强制重绘 + PrintWindow + md5 比对”三步并用。
 - 未验证：真实硬件（无设备接入），所有运动均为 DRYRUN 模拟帧；GUI 未在 100% 缩放与高 DPI 之外的分辨率下核验布局；未从非项目目录启动 GUI 的路径解析问题尚未修（见 bugs.md）。
+
+- 2026-09-21（晚·本窗口）：**修正 BLE「判在不在」的判据 + CLI 复测通过**。`ble_selftest.exe` 通过：建链 **0.56 s** → `RUN30,3000` → 3.31 s 收到 `DONE 30 3000`，EXIT=0（电机真转）。但同环境 `scan.py` 13s×2 **扫不到**、bleak 按地址连报 `DeviceNotFound(30s)`。用系统 Python 的 `winrt-*` 直读 WinRT：`FromBluetoothAddressAsync` **0.06 s** 拿到设备、`name='HC-05'`、**`connection_status = Connected (1)`**、`GetGattServicesWithCacheModeAsync(Uncached)` 0.36 s 返回 3 个服务（1800/1801/FFE0）→ **模块与 PC 已配对（`BTHPORT\...\Devices` 下有 `21f6473ad889` 记录），Windows 常驻保持链路，模块因此停止广播**。→ **新判据：扫描阳性可信、阴性不可信；决定性判据 = 「能否拿到设备对象 / 建链耗时」（0.1~0.6s=链路已在 / 2~3s=刚在广播 / 空等 25s=不在）。** 新增工具 `tmp/ble_poc/winrt_probe.py`（只读状态、不发运动指令，0.5s 出结果）；同步修正 workspace `电脑端蓝牙控制工具\蓝牙翻页验收清单.md` 与技能 `hc05-classic-bt-troubleshoot`（新增 1.8 节）。另发现并记录：**`g_dryRun` 管不到翻页**（翻页走 BLE 不是串口）→ Dry Run + 勾蓝牙翻页 = 臂不动、电机真转。**本轮代码零改动**（只新增诊断脚本 + 文档）。下一步：GUI 整任务验收（Dry Run 先跑）+ 手感标定。

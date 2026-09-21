@@ -137,3 +137,17 @@
 |------|------|----------|----------|
 | ✓ 已通过 2026-09-21 | 真机闭环：`scan.py` 15s 扫到 `21:F6:47:3A:D8:89 rssi=-65 HC-05`；`ble_selftest.exe` → 建链 **2.30 s** → 发 `RUN30,3000` → **3.33 s** 收到 `DONE 30 3000`，EXIT=0。 | 翻页真信号链路 | 模块上电后跑 `tmp/ble_poc/ble_selftest.exe` |
 | 判据留档 | **可达时建链约 2.3 s；不可达时约 25 s 才报错**（`comm=1 Unreachable`）。两条时间量级差 10 倍，可当作「模块在不在」的快速旁证。 | 快速排障 | 对比 `ble_selftest.exe` 的 `[2]` 耗时 |
+
+## 蓝牙「扫描假阴性」——模块已被 Windows 攥住链路（2026-09-21 晚，实锤）
+
+| 状态 | 描述 | 影响范围 | 复现步骤 / 判据 |
+|------|------|----------|----------|
+| **已定位·判据修正** | 模块**与 PC 已配对**（`HKLM\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices` 下有 `21f6473ad889` 链接密钥记录）。对已配对的 BLE 设备 **Windows 会常驻保持 LE 链路**；而 BLE 外设**一旦被连上就停止广播** → **`BleakScanner` 扫不到、bleak 按地址连报 `DeviceNotFound(30s)`，可 WinRT 按地址 0.06s 拿到设备、0.36s 枚举完 GATT、写特征与收通知全部正常、电机真转。** | 「判模块在不在」的全部诊断 | 跑 `tmp/ble_poc/winrt_probe.py`：应见 `connection_status = Connected (1)`、`name='HC-05'`、Uncached 服务 3 个（1800/1801/FFE0） |
+| **判据（背下来）** | **扫描阳性 ⇒ 可信；扫描阴性 ⇒ 不可信。** 决定性判据是「能否拿到设备对象 / 建链多快」：拿到 = 在（`Connected`/`Disconnected` **都算在**）；返回 `null` = 不在。建链耗时：链路已存在 **0.1~0.6s** ／ 刚在广播 **2~3s** ／ 不在 **空等 25s**。 | 排障 | 见上 |
+| **纠正 2026-09-20 的结论** | 当时把「`scan.py` 扫不到 ⇒ 模块没上电」当成定论并写进了技能与清单。**9-21 晚出现真实反例**：扫不到，但 WinRT 直连 **0.56s** 就跑通闭环。→「扫不到」只能说明**空口上没在广播**，**不能**推断不在。 | 方法论 | 对比本节与上一节 |
+| **想恢复广播** | Windows「设置 → 蓝牙和其他设备」里把 `HC-05X` **删除设备**（取消配对）→ 立刻恢复广播；或给模块断电重启（只那次有效，之后还会被重新连上）。 | 手机 App 要连它时 | — |
+| **非缺陷·须知晓** | **`g_dryRun` 管不到翻页**：翻页走 BLE，不是串口。所以「Dry Run + 勾蓝牙翻页」= 机械臂不动、**电机真转**。 | Dry Run 语义 | 勾 Dry Run + 勾蓝牙翻页，写两页 → 电机转 3s |
+
+- 新增工具：`tmp/ble_poc/winrt_probe.py`（Python `winrt-*` 直读链路状态，**不发运动指令**）。
+- 注：该枚举 `GattCacheMode` 在 Python 投影里没导出名字，`get_gatt_services_with_cache_mode_async` 直接传数值 **1**（=Uncached）。
+- 本机 `bleak` 3.0.2 装在系统 Python，`winrt-*` 是它的依赖 → 因此系统 Python 里也能直接调 WinRT。
