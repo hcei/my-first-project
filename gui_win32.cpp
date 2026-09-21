@@ -224,7 +224,6 @@ static HWND g_editSpacing = nullptr;
 static HWND g_editZoff = nullptr;
 static HWND g_editPreview = nullptr;
 static HWND g_editPlaneZ = nullptr;      // 书写平面页：新 Z 输入框
-static HWND g_btns[64] = {};            // ID 映射辅助
 static HWND g_checks[16] = {};
 static HWND g_cornerEdits[8] = {};      // 四角标定输入：[i*2]=角i X，[i*2+1]=角i Y
 
@@ -582,12 +581,15 @@ static WritePlot WritePlotGeo(const RECT& rc) {
     p.strip2 = RECT{ p.x + pad, p.strip.bottom + 2, p.x + p.w - pad, p.strip.bottom + 30 };
     {
         const int ty = p.strip2.top;
-        p.bleChkX = p.strip2.left;             p.bleChkW = 108;
-        p.gearLabX = p.bleChkX + p.bleChkW + 12; p.gearLabW = 56;
+        // 宽度按实测字宽定（见 tmp/measure_text.cpp 的量测结果），避免标签被省略成「…」：
+        //   「蓝牙翻页」72px(18px字) / 「档位(0~50)：」115px / 「时长(ms)：」95px / 「连接蓝牙」80px(20px粗体)
+        p.bleChkX = p.strip2.left;             p.bleChkW = 108;   // 复选框：72 + 勾选框
+        p.gearLabX = p.bleChkX + p.bleChkW + 12; p.gearLabW = 118;  // 「档位(0~50)：」= 115
         p.gearEdX  = p.gearLabX + p.gearLabW;    p.gearEdW  = 54;
-        p.runLabX  = p.gearEdX + p.gearEdW + 14; p.runLabW  = 86;
+        p.runLabX  = p.gearEdX + p.gearEdW + 14; p.runLabW  = 98;   // 「时长(ms)：」= 95
         p.runEdX   = p.runLabX + p.runLabW;      p.runEdW   = 76;
-        p.bleBtn   = RECT{ p.runEdX + p.runEdW + 14, ty, p.runEdX + p.runEdW + 84, ty + 25 };
+        p.bleBtn   = RECT{ p.runEdX + p.runEdW + 14, ty, p.runEdX + p.runEdW + 118, ty + 25 };
+        //   ↑「连接蓝牙」需要 80px 文字宽，原宽度只有 70px → 显示成「连接…」
         p.bleStX   = p.bleBtn.right + 14;
         p.bleStW   = p.strip2.right - p.bleStX;  if (p.bleStW < 60) p.bleStW = 60;
     }
@@ -1025,15 +1027,16 @@ static void MakeBtn(HWND parent, const BtnDef& d, int x, int y, int w, int h) {
     HWND b = CreateWindowW(L"BUTTON", d.text, WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | BS_OWNERDRAW,
                            x, y, w, h, parent, (HMENU)(INT_PTR)d.id, nullptr, nullptr);
     SendMessage(b, WM_SETFONT, (WPARAM)g_fontBold20, TRUE);
-    int slot = d.id - 1000;
-    if (slot >= 0 && slot < 64) g_btns[slot] = b;
+    // 无需登记句柄：DestroyPageControls() 直接枚举并销毁主窗口的全部子控件。
 }
 
 // owner-draw：圆角实底色按钮（对应 HTML .button）
 static void DrawBtn(LPDRAWITEMSTRUCT di) {
-    int slot = (int)(UINT_PTR)GetDlgCtrlID(di->hwndItem) - 1000;
     COLORREF base = BLUE;
-    if (slot >= 0 && slot < 64) {
+    {
+        // 直接按控件 ID 选底色。
+        // （原先外面套了 slot(=id-1000) < 64 的判断，ID 较大的「连接蓝牙」
+        //   会跳过整个 switch、拿到默认 BLUE 而不是 TEAL —— 2026-09-21 修）
         switch (GetDlgCtrlID(di->hwndItem)) {
         case IDC_BTN_TESTPT: case IDC_BTN_CONNECT: case IDC_BTN_WRITE: case IDC_BTN_PLANE_PREVIEW:
         case IDC_BTN_BLECONN:
@@ -1120,24 +1123,37 @@ static void OnPaint(HWND hwnd) {
 }
 
 // ---------------- 子控件创建（每页切换重建） ----------------
-static void DestroyPageControls() {
-    for (auto& b : g_btns) if (b) { DestroyWindow(b); b = nullptr; }
-    for (auto& c : g_checks) if (c) { DestroyWindow(c); c = nullptr; }
-    if (g_comboPort) { DestroyWindow(g_comboPort); g_comboPort = nullptr; }
-    if (g_editText) { DestroyWindow(g_editText); g_editText = nullptr; }
-    if (g_editSpacing) { DestroyWindow(g_editSpacing); g_editSpacing = nullptr; }
-    if (g_editZoff) { DestroyWindow(g_editZoff); g_editZoff = nullptr; }
-    if (g_editPreview) { DestroyWindow(g_editPreview); g_editPreview = nullptr; }
-    if (g_editPlaneZ) { DestroyWindow(g_editPlaneZ); g_editPlaneZ = nullptr; }
-    for (auto& e : g_cornerEdits) if (e) { DestroyWindow(e); e = nullptr; }
-    if (g_editCharSize) { DestroyWindow(g_editCharSize); g_editCharSize = nullptr; }
-    if (g_comboOrient) { DestroyWindow(g_comboOrient); g_comboOrient = nullptr; }
-    if (g_editPageCh) { DestroyWindow(g_editPageCh); g_editPageCh = nullptr; }
-    if (g_editPgCnt) { DestroyWindow(g_editPgCnt); g_editPgCnt = nullptr; }
-    if (g_editTurnWait) { DestroyWindow(g_editTurnWait); g_editTurnWait = nullptr; }
-    if (g_editTurnGear) { DestroyWindow(g_editTurnGear); g_editTurnGear = nullptr; }
-    if (g_editTurnRun)  { DestroyWindow(g_editTurnRun);  g_editTurnRun  = nullptr; }
-    if (g_stcTrunc) { DestroyWindow(g_stcTrunc); g_stcTrunc = nullptr; }
+// ★销毁当前页的全部子控件。
+//   2026-09-21 修：旧实现靠 g_btns[64]（下标 = 控件ID - 1000）登记按钮句柄，
+//   按钮 ID 一旦超过 1063 就越界、登记失败 → IDC_BTN_PAGE_NEXT(1064) 与
+//   IDC_BTN_BLECONN(1067) 永远销毁不掉，切换页面后残留、错位在别的页上。
+//   现在改为「枚举主窗口的直接子窗口并全部销毁」，新增控件自动覆盖，不会再漏。
+static void DestroyPageControls(HWND hwnd) {
+    // 先收集再销毁：边枚举边销毁会让 HWND 链表失效。只取直接子窗口，
+    // 不递归（避免动到 COMBOBOX 内部的编辑框/列表框）。
+    std::vector<HWND> kids;
+    for (HWND c = GetWindow(hwnd, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT))
+        kids.push_back(c);
+    for (HWND c : kids) DestroyWindow(c);
+
+    // 句柄清零。控件已在上面销毁，这里只清指针，避免留下悬空句柄。
+    // ⚠ 以后新增子控件，必须在这里补一行清零。
+    for (auto& c : g_checks) c = nullptr;
+    for (auto& e : g_cornerEdits) e = nullptr;
+    g_comboPort = nullptr;
+    g_editText = nullptr;
+    g_editSpacing = nullptr;
+    g_editZoff = nullptr;
+    g_editPreview = nullptr;
+    g_editPlaneZ = nullptr;
+    g_editCharSize = nullptr;
+    g_comboOrient = nullptr;
+    g_editPageCh = nullptr;
+    g_editPgCnt = nullptr;
+    g_editTurnWait = nullptr;
+    g_editTurnGear = nullptr;
+    g_editTurnRun = nullptr;
+    g_stcTrunc = nullptr;
     g_pgEdit = 0; g_pgTotal = 0; g_pgWritten = 0; g_pgPartial = true;
     g_prevCells.clear(); g_prevValid = false;
     g_dragging = false; g_dragIdx = -1;
@@ -1890,7 +1906,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 int np = NAV[idx].id;
                 if (np != g_st.page) {
                     g_st.page = np;
-                    DestroyPageControls();
+                    DestroyPageControls(hwnd);
                     if (np == ID_PAGE_HOME) CreateHomeControls(hwnd);
                     else if (np == ID_PAGE_CONNECT) CreateConnectControls(hwnd);
                     else if (np == ID_PAGE_WRITE) CreateWriteControls(hwnd);
@@ -1954,7 +1970,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         // 窗口尺寸变化：重建当前页控件，保持布局与绘制一致
         if (g_st.hwnd) {
-            DestroyPageControls();
+            DestroyPageControls(hwnd);
             if (g_st.page == ID_PAGE_HOME) CreateHomeControls(hwnd);
             else if (g_st.page == ID_PAGE_CONNECT) CreateConnectControls(hwnd);
             else if (g_st.page == ID_PAGE_WRITE) CreateWriteControls(hwnd);

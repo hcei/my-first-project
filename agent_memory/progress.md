@@ -153,3 +153,9 @@
 - 未验证：真实硬件（无设备接入），所有运动均为 DRYRUN 模拟帧；GUI 未在 100% 缩放与高 DPI 之外的分辨率下核验布局；未从非项目目录启动 GUI 的路径解析问题尚未修（见 bugs.md）。
 
 - 2026-09-21（晚·本窗口）：**修正 BLE「判在不在」的判据 + CLI 复测通过**。`ble_selftest.exe` 通过：建链 **0.56 s** → `RUN30,3000` → 3.31 s 收到 `DONE 30 3000`，EXIT=0（电机真转）。但同环境 `scan.py` 13s×2 **扫不到**、bleak 按地址连报 `DeviceNotFound(30s)`。用系统 Python 的 `winrt-*` 直读 WinRT：`FromBluetoothAddressAsync` **0.06 s** 拿到设备、`name='HC-05'`、**`connection_status = Connected (1)`**、`GetGattServicesWithCacheModeAsync(Uncached)` 0.36 s 返回 3 个服务（1800/1801/FFE0）→ **模块与 PC 已配对（`BTHPORT\...\Devices` 下有 `21f6473ad889` 记录），Windows 常驻保持链路，模块因此停止广播**。→ **新判据：扫描阳性可信、阴性不可信；决定性判据 = 「能否拿到设备对象 / 建链耗时」（0.1~0.6s=链路已在 / 2~3s=刚在广播 / 空等 25s=不在）。** 新增工具 `tmp/ble_poc/winrt_probe.py`（只读状态、不发运动指令，0.5s 出结果）；同步修正 workspace `电脑端蓝牙控制工具\蓝牙翻页验收清单.md` 与技能 `hc05-classic-bt-troubleshoot`（新增 1.8 节）。另发现并记录：**`g_dryRun` 管不到翻页**（翻页走 BLE 不是串口）→ Dry Run + 勾蓝牙翻页 = 臂不动、电机真转。**本轮代码零改动**（只新增诊断脚本 + 文档）。下一步：GUI 整任务验收（Dry Run 先跑）+ 手感标定。
+- 2026-09-21（晚·本窗口）：**修 UI「按钮跑到别的页上」+ 跨进程探针验证通过**。
+  - 根因：`MakeBtn` 的 `g_btns[64]`（下标 = ID−1000）在 ID ≥ 1064 时越界登记失败，`IDC_BTN_PAGE_NEXT`(1064)、`IDC_BTN_BLECONN`(1067) 永远销毁不掉 → 切页残留、逐次累积。
+  - 修法：`DestroyPageControls(hwnd)` 改为枚举主窗口直接子窗口统一销毁（不再按 ID 记账）；并修 `DrawBtn` 同源越界判断导致的 `连接蓝牙` 配色错误；按实测字宽修该行尺寸（`连接蓝牙` 80px 原按钮 70px 被截成「连接…」）。
+  - 验证：新写 `tmp/ble_poc/probe_children.exe`（跨进程枚举直接子控件 + 模拟点导航）做 A/B。旧实例主页 49→51 个控件且必现两个残留按钮；新实例各页恒为 19/5/35/3，无残留。
+  - 新增工具：`tmp/ble_poc/probe_children.cpp/.exe`、`tmp/ble_poc/measure_text.cpp`（按 GDI 字体实测文案像素宽，避免拍脑袋定控件宽度）。
+  - **未完成**：`RobotGUI.exe` 被运行中的实例（pid 12332）占用无法覆盖，修复版暂存为 `RobotGUI_fix.exe`；关闭旧 GUI 后需替换并改名。
