@@ -137,6 +137,10 @@ using PageTurnFn = std::function<bool(int page_no_1based, int page_total)>;
 void set_page_turn_handler(PageTurnFn fn); // 注入真实蓝牙翻页实现（传 nullptr 恢复默认模拟）
 bool set_page_turn_wait_ms(int ms);        // 模拟等待时长 500~60000ms，持久化
 int  page_turn_wait_ms();
+bool set_point_fixed_ms(int ms);           // 落笔每点固定开销 C(ms) 0~300；自动配平 z_settle=107-C
+int  point_fixed_ms();
+bool set_rdp_tol_mm(float mm);             // 书法段 RDP 抽稀容差(mm) 0.02~3.0
+float rdp_tol_mm();
 bool preview_writing_plane(float z, std::string& err);  // 移到 (0,0,z) 悬停，确认书写高度（不书写）
 bool set_writing_plane(float z, std::string& err);      // 保存书写平面 Z：生效 + 持久化（后续书写统一用该 Z）
 // —— 四角标定（实时轨迹面板）：预览=抬笔移到该角(真机移动)；保存=固定并持久化；清除=复位 —— //

@@ -100,6 +100,11 @@ static const float RESAMPLE_STEP_MM_BASE = 1.2f;
 // COLD_START_MIN_MS：每次下发调用开始的首秒内，指令间隔不小于此值（设备刚“醒”时更保守）。
 static const int   MIN_POINT_INTERVAL_MS = 12;
 static const int   COLD_START_MIN_MS = 150;
+// POINT_FIXED_MS_BASE：每个落笔点的固定开销 C(ms)——碎段加减速/伺服整定在地板之上的常数项，
+//   由 estimateMoveMs 计入 base = max(地板, d/v + C)。历史由拐角 bug 隐式兜着，现显式化、可扫参。
+static const int   POINT_FIXED_MS_BASE = 80;
+// RDP_TOL_MM_BASE：书法段 RDP 抽稀容差(mm)。越大→点越少→停顿越少(治顿挫)；拐角/小结构天然保点。
+static const float RDP_TOL_MM_BASE = 0.35f;
 
 // —— 运行期可调节拍（随 robot_config.json 持久化，改后重启生效；默认取上面的 *_BASE 常量）—— //
 // 真机扫参用：把每笔 Z 沉降 / 起收笔 dwell / 冷启动 / 逐点下限做成可配置，无需重编译。
@@ -108,6 +113,8 @@ extern int g_stroke_begin_ms;        // 落笔起笔 dwell(ms)
 extern int g_stroke_end_ms;          // 收笔 dwell(ms)
 extern int g_cold_start_min_ms;      // 冷启动首秒指令间隔下限(ms)
 extern int g_min_point_interval_ms;  // 落笔逐点最小指令间隔(ms)
+extern int g_point_fixed_ms;         // 每落笔点固定开销 C(ms)，计入 estimateMoveMs 的 base
+extern float g_rdp_tol_mm;           // 书法段 RDP 抽稀容差(mm)，config 可调
 
 // 探边
 static const float PROBE_STEP_DEFAULT = 5.0f;

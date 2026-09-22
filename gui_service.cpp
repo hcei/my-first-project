@@ -1029,6 +1029,27 @@ bool set_page_turn_wait_ms(int ms) {
 }
 int page_turn_wait_ms() { return g_page_turn_wait_ms; }
 
+// —— 实时调参：落笔每点固定开销 C(ms) 与 RDP 抽稀容差(mm)（治顿挫两旋钮）—— //
+// 改 C 时自动把 z_settle 配平成 107-C，保证 Z 过渡预算(C+z_settle)恒为 107ms（Phase1 验证的静压、不炸毛/不欠压）。
+bool set_point_fixed_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 300) return false;
+    g_point_fixed_ms = ms;
+    int zs = 107 - ms; if (zs < 0) zs = 0;
+    g_z_settle_ms = zs;
+    cfg_save();
+    return true;
+}
+int point_fixed_ms() { return g_point_fixed_ms; }
+bool set_rdp_tol_mm(float mm) {
+    if (g_task_active) return false;
+    if (mm < 0.02f || mm > 3.0f) return false;
+    g_rdp_tol_mm = mm;
+    cfg_save();
+    return true;
+}
+float rdp_tol_mm() { return g_rdp_tol_mm; }
+
 // 实时排版预览：不写审计；据当前文本重切页（文本未变的页保留拖拽坐标），
 // 返回【当前编辑页】的叠画字块与分页信息，供 GUI 书写页画布/翻页条即时刷新。
 json layout_preview(const std::string& utf8_text) {
@@ -1200,21 +1221,27 @@ static void run_task_thread(std::string text) {
             }
         }   // ← 本页逐字循环结束
 
+        // ★页尾自动复位（抬笔）：本页写完即在最末落笔点原位抬笔并短驻，每页（含末页）必有。
+        //   字形轨迹末点虽已是 UP-ENDCHAR，此处仍显式再发一次 Z_UP 作确认复位，保证页尾
+        //   最后一笔书写与后续补蘸/翻页拖纸之间笔一定抬起；放在补蘸之前，抬笔不被后续动作替代。
+        //   非末页翻页前的抬笔（原 UP-PAGETURN）已并入本动作，避免同页重复抬笔。
+        {
+            Point resetUp = Point{ g_last_pose.x, g_last_pose.y, Z_UP, false,
+                                   (uint8_t)SPEED_LEVEL, "UP-PAGEEND" };
+            g_port.sendPointRetry(resetUp);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));   // 页尾短驻
+        }
+
         // 页尾补蘸：全局计数不满 5 的倍数且后面还有页要写（保持原“书写结束前至少一次蘸墨”语义）
         if (g_enableDip && gci % 5 != 0 && pi + 1 < nPages) {
             task::stage("蘸墨");
             if (!do_dip_and_groom(g_port, g_ink)) { end_task(false, "failed", "dip"); return; }
         }
 
-        // —— 翻页（仅非末页）：抬笔 → 通知 GUI 切页 → 蓝牙信号(当前为模拟等待) → 清轨迹 —— //
+        // —— 翻页（仅非末页）：通知 GUI 切页 → 蓝牙信号(当前为模拟等待) → 清轨迹（抬笔已在页尾 UP-PAGEEND 完成） —— //
         if (pi + 1 < nPages) {
             {
                 std::lock_guard<std::recursive_mutex> lk(g_mu);
-                // 抬笔到当页末字正上方，避免拖纸时笔尖蹭纸
-                const Offset& lastOfs = plan.offsets.back();
-                Point up = Point{ lastOfs.x + S / 2, lastOfs.y + S / 2, Z_UP, false,
-                                  (uint8_t)SPEED_LEVEL, "UP-PAGETURN" };
-                if (g_port.sendPointRetry(up)) task::traj_add_done(1, false);
                 session_id();
                 json ev = op_event("page_turn", nullptr);
                 ev["parameters"] = { { "turn_to_page", pi + 2 }, { "page_total", nPages },
@@ -1394,6 +1421,8 @@ bool cfg_save() {
     j["stroke_end_ms"]         = g_stroke_end_ms;
     j["cold_start_min_ms"]     = g_cold_start_min_ms;
     j["min_point_interval_ms"] = g_min_point_interval_ms;
+    j["point_fixed_ms"]        = g_point_fixed_ms;
+    j["rdp_tol_mm"]            = g_rdp_tol_mm;
     j["writing_plane_z"]       = g_writing_plane_z;
     j["writing_plane_valid"]   = g_writing_plane_valid;
     j["layout_mode"]           = g_layout_mode;
@@ -1459,11 +1488,20 @@ void cfg_load() {
                 if (!j.contains(k) || !j[k].is_number()) return cur;
                 return clampi(j[k].get<long long>(), 0, 3000);
                 };
+            auto getf = [&](const char* k, float cur)->float{
+                if (!j.contains(k) || !j[k].is_number()) return cur;
+                double v = j[k].get<double>();
+                if (!std::isfinite(v)) return cur;
+                if (v < 0.02) v = 0.02; if (v > 3.0) v = 3.0f;
+                return (float)v;
+                };
             g_z_settle_ms           = geti("z_settle_ms",           g_z_settle_ms);
             g_stroke_begin_ms       = geti("stroke_begin_ms",       g_stroke_begin_ms);
             g_stroke_end_ms         = geti("stroke_end_ms",         g_stroke_end_ms);
             g_cold_start_min_ms     = geti("cold_start_min_ms",     g_cold_start_min_ms);
             g_min_point_interval_ms = geti("min_point_interval_ms", g_min_point_interval_ms);
+            g_point_fixed_ms        = geti("point_fixed_ms",        g_point_fixed_ms);
+            g_rdp_tol_mm            = getf("rdp_tol_mm",            g_rdp_tol_mm);
         }
         if (j.contains("writing_plane_z") && j["writing_plane_z"].is_number()) {
             float z = j["writing_plane_z"].get<float>();
