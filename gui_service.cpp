@@ -1062,6 +1062,12 @@ bool set_rdp_tol_curve_mm(float mm) {
     g_rdp_tol_curve_mm = mm; cfg_save(); return true;
 }
 float rdp_tol_curve_mm() { return g_rdp_tol_curve_mm; }
+bool set_z_settle_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 3000) return false;
+    g_z_settle_ms = ms; cfg_save(); return true;   // 直设，不调 sync_z_settle（否则被 107-min(C直,C弯) 覆盖）
+}
+int z_settle_ms() { return g_z_settle_ms; }
 
 // 实时排版预览：不写审计；据当前文本重切页（文本未变的页保留拖拽坐标），
 // 返回【当前编辑页】的叠画字块与分页信息，供 GUI 书写页画布/翻页条即时刷新。

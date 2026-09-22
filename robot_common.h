@@ -78,10 +78,12 @@ extern float g_lm_row_spacing;     // 行间距 mm（独立于列内 CHAR_SPACIN
 // 独立于自动/手动模式，决定 TextPlan.offsets 的字序映射。随 robot_config.json 持久化。
 extern int   g_write_dir;
 
-// 速度档（1~6）
+// 速度档（1~10）：档 lvl → 设备字节 = lvl-1（帧层 serial_port.cpp 夹到 0~9）。
+// 手册"00 为最快速度"⇒ 档1=byte0=最快；档10=byte9=慢端候选（是否真最慢须"看墨"实测，勿立军令状）。
+// 计时已与档位解耦（motion.cpp 按 isPenDown 取 v），SPEED_MAX 仅作档位范围校验，改此值不碰完整性。
 extern int SPEED_LEVEL;
 static const int SPEED_MIN = 1;
-static const int SPEED_MAX = 6;
+static const int SPEED_MAX = 10;
 
 // 发送基本延时
 static const int DELAY_MS = 35;
