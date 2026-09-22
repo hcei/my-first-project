@@ -74,7 +74,9 @@ int g_stroke_end_ms         = STROKE_END_DWELL_MS_BASE;  // 90
 int g_cold_start_min_ms     = COLD_START_MIN_MS;         // 150
 int g_min_point_interval_ms = MIN_POINT_INTERVAL_MS;     // 12
 int g_point_fixed_ms        = POINT_FIXED_MS_BASE;       // 80  每落笔点固定开销 C
-float g_rdp_tol_mm          = RDP_TOL_MM_BASE;           // 0.35 书法段 RDP 抽稀容差(mm)
+float g_rdp_tol_mm          = RDP_TOL_MM_BASE;           // 0.35 直线段 RDP 抽稀容差(mm)
+int g_point_fixed_curve_ms  = POINT_FIXED_CURVE_MS_BASE; // 55  曲线段每点固定开销 C
+float g_rdp_tol_curve_mm    = RDP_TOL_CURVE_MM_BASE;     // 0.15 曲线段 RDP 抽稀容差(mm)
 
 static FILE* g_logFile = nullptr;
 

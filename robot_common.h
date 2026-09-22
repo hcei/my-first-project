@@ -104,7 +104,10 @@ static const int   COLD_START_MIN_MS = 150;
 //   由 estimateMoveMs 计入 base = max(地板, d/v + C)。历史由拐角 bug 隐式兜着，现显式化、可扫参。
 static const int   POINT_FIXED_MS_BASE = 80;
 // RDP_TOL_MM_BASE：书法段 RDP 抽稀容差(mm)。越大→点越少→停顿越少(治顿挫)；拐角/小结构天然保点。
+//   注：point_fixed_ms / rdp_tol_mm = 直线段(横/竖)组；*_curve = 曲线段(撇/捺/弯钩)组。
 static const float RDP_TOL_MM_BASE = 0.35f;
+static const int   POINT_FIXED_CURVE_MS_BASE = 55;
+static const float RDP_TOL_CURVE_MM_BASE = 0.15f;
 
 // —— 运行期可调节拍（随 robot_config.json 持久化，改后重启生效；默认取上面的 *_BASE 常量）—— //
 // 真机扫参用：把每笔 Z 沉降 / 起收笔 dwell / 冷启动 / 逐点下限做成可配置，无需重编译。
@@ -115,6 +118,8 @@ extern int g_cold_start_min_ms;      // 冷启动首秒指令间隔下限(ms)
 extern int g_min_point_interval_ms;  // 落笔逐点最小指令间隔(ms)
 extern int g_point_fixed_ms;         // 每落笔点固定开销 C(ms)，计入 estimateMoveMs 的 base
 extern float g_rdp_tol_mm;           // 书法段 RDP 抽稀容差(mm)，config 可调
+extern int g_point_fixed_curve_ms;   // 曲线段(撇/捺/弯钩)每点固定开销 C(ms)
+extern float g_rdp_tol_curve_mm;     // 曲线段 RDP 抽稀容差(mm)
 
 // 探边
 static const float PROBE_STEP_DEFAULT = 5.0f;
@@ -147,6 +152,7 @@ struct Point {
     bool isPenDown{ false };
     uint8_t speed{ 3 };
     std::string zType;
+    uint8_t strokeKind{ 0 };   // 落笔段类型：0=直线(横/竖)→用 point_fixed_ms/rdp_tol_mm；1=曲线(撇/捺/弯钩)→用 *_curve
 };
 
 struct WorkArea {

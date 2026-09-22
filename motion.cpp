@@ -130,10 +130,10 @@ int estimateMoveMs(const Point& prev, const Point& cur, bool isCalli) {
     if (std::fabs(cur.z - prev.z) > 1.0f) extra += get_Z_SETTLE_MS(isCalli);
 
     // 目标间隔 = max(最小节拍, 运动时间 + 每点固定开销 C) + 物理停顿 extra。
-    // C(g_point_fixed_ms, 默认 80ms)= 碎段加减速/伺服整定的地板之上常数项：以前由拐角停顿 bug
-    // (angle_between 判据反了、100% 命中直段)隐式替每点兜着；本轮修拐角判据的同时，把它显式化到计时模型里，
-    // 二者必须同批落地——只修拐角不加 C，会让 54~95% 的落笔点掉到 43ms 串口地板 → 全档一起变残。
-    int base = std::max(g_min_point_interval_ms, t_xy + g_point_fixed_ms);
+    // C 按落笔段类型分两组：直线段(横/竖)=g_point_fixed_ms、曲线段(撇/捺/弯钩)=g_point_fixed_curve_ms。
+    // （strokeKind 由 transmitTrajectoryWithSplit 的两段式 RDP 分类打标。）
+    int Cfix = (cur.isPenDown && cur.strokeKind == 1) ? g_point_fixed_curve_ms : g_point_fixed_ms;
+    int base = std::max(g_min_point_interval_ms, t_xy + Cfix);
     return base + extra;
 }
 
@@ -183,7 +183,22 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
             size_t j = i;
             std::vector<Point> seg;
             for (; j < end && filtered[j].isPenDown == pen; ++j) seg.push_back(filtered[j]);
-            if (pen) { if (adaptive) resamplePolylineRDP(seg, param); else resamplePolyline(seg, param); }
+            if (pen && adaptive) {
+                // 两段式分类：先按【直线容差】RDP。塌到 ≤2 点 ⇒ 直线段(横/竖)，直接用；
+                // 否则 ⇒ 曲线段(撇/捺/弯钩)，对【原始 seg】按【曲线容差】重算(保形)。
+                std::vector<Point> probe = seg;
+                resamplePolylineRDP(probe, g_rdp_tol_mm);
+                if (probe.size() <= 2) {
+                    seg = probe;
+                    for (auto& p : seg) p.strokeKind = 0;
+                } else {
+                    resamplePolylineRDP(seg, g_rdp_tol_curve_mm);
+                    for (auto& p : seg) p.strokeKind = 1;
+                }
+            } else if (pen) {
+                resamplePolyline(seg, param);   // 描边段定步长
+                for (auto& p : seg) p.strokeKind = 0;
+            }
             out.insert(out.end(), seg.begin(), seg.end());
             i = j;
         }

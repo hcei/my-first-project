@@ -424,6 +424,8 @@ json snapshot() {
         { "layout_row_spacing", g_lm_row_spacing }, { "write_dir", g_write_dir },
         { "free_char_size", g_free_char_size }, { "glyph_orient", g_glyph_orient },
         { "page_chars", g_page_chars }, { "page_count", g_page_count },
+        { "point_fixed_ms", g_point_fixed_ms }, { "point_fixed_curve_ms", g_point_fixed_curve_ms },
+        { "rdp_tol_mm", g_rdp_tol_mm }, { "rdp_tol_curve_mm", g_rdp_tol_curve_mm },
         { "edit_page", g_edit_page }, { "page_turn_wait_ms", g_page_turn_wait_ms },
         { "task_finished", (bool)g_task_finished },
         { "text_total", (int)g_full_all.size() },
@@ -1029,26 +1031,37 @@ bool set_page_turn_wait_ms(int ms) {
 }
 int page_turn_wait_ms() { return g_page_turn_wait_ms; }
 
-// —— 实时调参：落笔每点固定开销 C(ms) 与 RDP 抽稀容差(mm)（治顿挫两旋钮）—— //
-// 改 C 时自动把 z_settle 配平成 107-C，保证 Z 过渡预算(C+z_settle)恒为 107ms（Phase1 验证的静压、不炸毛/不欠压）。
+// —— 实时调参：落笔每点固定开销 C 与 RDP 抽稀容差，各分【直线段(横/竖)】/【曲线段(撇/捺/弯钩)】两组 —— //
+// 改任一 C 时把 z_settle 配平成 107 - min(C直,C弯)，保证两组 Z 过渡预算(C+z_settle)都 ≥107ms（Phase1 静压、不炸毛/不欠压）。
+static void sync_z_settle() {
+    int cmin = std::min(g_point_fixed_ms, g_point_fixed_curve_ms);
+    int zs = 107 - cmin; if (zs < 0) zs = 0; if (zs > 3000) zs = 3000;
+    g_z_settle_ms = zs;
+}
 bool set_point_fixed_ms(int ms) {
     if (g_task_active) return false;
     if (ms < 0 || ms > 300) return false;
-    g_point_fixed_ms = ms;
-    int zs = 107 - ms; if (zs < 0) zs = 0;
-    g_z_settle_ms = zs;
-    cfg_save();
-    return true;
+    g_point_fixed_ms = ms; sync_z_settle(); cfg_save(); return true;
 }
 int point_fixed_ms() { return g_point_fixed_ms; }
+bool set_point_fixed_curve_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 300) return false;
+    g_point_fixed_curve_ms = ms; sync_z_settle(); cfg_save(); return true;
+}
+int point_fixed_curve_ms() { return g_point_fixed_curve_ms; }
 bool set_rdp_tol_mm(float mm) {
     if (g_task_active) return false;
     if (mm < 0.02f || mm > 3.0f) return false;
-    g_rdp_tol_mm = mm;
-    cfg_save();
-    return true;
+    g_rdp_tol_mm = mm; cfg_save(); return true;
 }
 float rdp_tol_mm() { return g_rdp_tol_mm; }
+bool set_rdp_tol_curve_mm(float mm) {
+    if (g_task_active) return false;
+    if (mm < 0.02f || mm > 3.0f) return false;
+    g_rdp_tol_curve_mm = mm; cfg_save(); return true;
+}
+float rdp_tol_curve_mm() { return g_rdp_tol_curve_mm; }
 
 // 实时排版预览：不写审计；据当前文本重切页（文本未变的页保留拖拽坐标），
 // 返回【当前编辑页】的叠画字块与分页信息，供 GUI 书写页画布/翻页条即时刷新。
@@ -1422,7 +1435,9 @@ bool cfg_save() {
     j["cold_start_min_ms"]     = g_cold_start_min_ms;
     j["min_point_interval_ms"] = g_min_point_interval_ms;
     j["point_fixed_ms"]        = g_point_fixed_ms;
+    j["point_fixed_curve_ms"]  = g_point_fixed_curve_ms;
     j["rdp_tol_mm"]            = g_rdp_tol_mm;
+    j["rdp_tol_curve_mm"]      = g_rdp_tol_curve_mm;
     j["writing_plane_z"]       = g_writing_plane_z;
     j["writing_plane_valid"]   = g_writing_plane_valid;
     j["layout_mode"]           = g_layout_mode;
@@ -1501,7 +1516,9 @@ void cfg_load() {
             g_cold_start_min_ms     = geti("cold_start_min_ms",     g_cold_start_min_ms);
             g_min_point_interval_ms = geti("min_point_interval_ms", g_min_point_interval_ms);
             g_point_fixed_ms        = geti("point_fixed_ms",        g_point_fixed_ms);
+            g_point_fixed_curve_ms  = geti("point_fixed_curve_ms",  g_point_fixed_curve_ms);
             g_rdp_tol_mm            = getf("rdp_tol_mm",            g_rdp_tol_mm);
+            g_rdp_tol_curve_mm      = getf("rdp_tol_curve_mm",      g_rdp_tol_curve_mm);
         }
         if (j.contains("writing_plane_z") && j["writing_plane_z"].is_number()) {
             float z = j["writing_plane_z"].get<float>();
