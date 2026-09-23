@@ -104,7 +104,7 @@
   "page_text": "欲穷千里目更上一层楼",
   "page_text_full": "欲穷千里目更上一层楼",
   "page_turn_ble": true,
-  "page_turn_gear": 30,
+  "page_turn_gear": 15,
   "page_turn_run_ms": 3000,
   "page_turn_wait_ms": 3000,
   "speed": 3,

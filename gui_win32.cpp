@@ -233,7 +233,7 @@ static HWND g_comboOrient  = nullptr;   // 书写方向（字体朝向）下拉�
 static HWND g_editPageCh   = nullptr;   // 每页字数输入框
 static HWND g_editPgCnt    = nullptr;   // 总页数输入框
 static HWND g_editTurnWait = nullptr;   // 翻页模拟等待 ms 输入框（轨迹面板翻页条内）
-static HWND g_editTurnGear = nullptr;   // ★蓝牙翻页：档位输入框 0~50
+static HWND g_editTurnGear = nullptr;   // ★蓝牙翻页：档位输入框 0~gs::PAGE_TURN_GEAR_MAX
 static HWND g_editTurnRun  = nullptr;   // ★蓝牙翻页：每次转动时长 ms
 static HWND g_stcTrunc     = nullptr;   // 截断提示文本（超容量时显示）
 // 分页缓存（UI 线程；RefreshLayoutPreview 更新）：编辑页/总页数/本次要写页数/页内是否有字
@@ -582,9 +582,10 @@ static WritePlot WritePlotGeo(const RECT& rc) {
     {
         const int ty = p.strip2.top;
         // 宽度按实测字宽定（见 tmp/measure_text.cpp 的量测结果），避免标签被省略成「…」：
-        //   「蓝牙翻页」72px(18px字) / 「档位(0~50)：」115px / 「时长(ms)：」95px / 「连接蓝牙」80px(20px粗体)
+        //   「蓝牙翻页」72px(18px字) / 「档位(0~20)：」115px / 「时长(ms)：」95px / 「连接蓝牙」80px(20px粗体)
+        //   ↑ 档位标签文字由 gs::PAGE_TURN_GEAR_MAX 动态拼出；上限若是三位数需同步加宽 gearLabW
         p.bleChkX = p.strip2.left;             p.bleChkW = 108;   // 复选框：72 + 勾选框
-        p.gearLabX = p.bleChkX + p.bleChkW + 12; p.gearLabW = 118;  // 「档位(0~50)：」= 115
+        p.gearLabX = p.bleChkX + p.bleChkW + 12; p.gearLabW = 118;  // 「档位(0~20)：」= 115
         p.gearEdX  = p.gearLabX + p.gearLabW;    p.gearEdW  = 54;
         p.runLabX  = p.gearEdX + p.gearEdW + 14; p.runLabW  = 98;   // 「时长(ms)：」= 95
         p.runEdX   = p.runLabX + p.runLabW;      p.runEdW   = 76;
@@ -704,7 +705,9 @@ static void DrawTrailPanel(HDC dc, const WritePlot& p) {
         Text(dc, pg, p.pgLabX, p.strip.top, p.pgLabW, 26, g_pgPartial && !act ? WARN : INK, 16, true);
         Text(dc, L"翻页等待(ms)：", p.waitLabX, p.strip.top, p.waitLabW, 26, MUTED, 14, true);
         // ★蓝牙翻页第二行：此处只画标签与状态文本（复选框/输入框/按钮均为子控件）
-        Text(dc, L"档位(0~50)：", p.gearLabX, p.strip2.top, p.gearLabW, 26, MUTED, 14, true);
+        //  档位上限只认 gs::PAGE_TURN_GEAR_MAX，避免界面写着 0~50、实际只收到 0~20
+        Text(dc, L"档位(0~" + std::to_wstring(gs::PAGE_TURN_GEAR_MAX) + L")：",
+             p.gearLabX, p.strip2.top, p.gearLabW, 26, MUTED, 14, true);
         Text(dc, L"时长(ms)：",   p.runLabX,  p.strip2.top, p.runLabW,  26, MUTED, 14, true);
         {
             std::string bs = snapS("cfg", "ble_state");
@@ -1369,7 +1372,7 @@ static void CreateWriteControls(HWND hwnd) {
                                          wp.gearEdX, wp.strip2.top, wp.gearEdW, 24, hwnd,
                                          (HMENU)(INT_PTR)IDC_EDIT_TURNGEAR, nullptr, nullptr);
         SendMessage(g_editTurnGear, WM_SETFONT, (WPARAM)g_font16, TRUE);
-        SetWindowTextW(g_editTurnGear, std::to_wstring(snapI("cfg", "page_turn_gear", 30)).c_str());
+        SetWindowTextW(g_editTurnGear, std::to_wstring(snapI("cfg", "page_turn_gear", 15)).c_str());
 
         g_editTurnRun = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
                                         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
@@ -1871,8 +1874,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (code == EN_KILLFOCUS && ctl == g_editPgCnt) { CommitIntField(g_editPgCnt, gs::set_page_count, 1, 20, L"总页数"); RefreshLayoutPreview(); return 0; }
             if (code == EN_KILLFOCUS && ctl == g_editTurnWait) { CommitIntField(g_editTurnWait, gs::set_page_turn_wait_ms, 500, 60000, L"翻页等待(ms)"); return 0; }
             // ★蓝牙翻页参数（档位 / 转动时长）：与上面同款两段式套用
-            if (code == EN_CHANGE && ctl == g_editTurnGear) { ApplyIntField(g_editTurnGear, gs::set_page_turn_gear, 0, 50); return 0; }
-            if (code == EN_KILLFOCUS && ctl == g_editTurnGear) { CommitIntField(g_editTurnGear, gs::set_page_turn_gear, 0, 50, L"档位"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editTurnGear) { ApplyIntField(g_editTurnGear, gs::set_page_turn_gear, 0, gs::PAGE_TURN_GEAR_MAX); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editTurnGear) { CommitIntField(g_editTurnGear, gs::set_page_turn_gear, 0, gs::PAGE_TURN_GEAR_MAX, L"档位"); return 0; }
             if (code == EN_CHANGE && ctl == g_editTurnRun) { ApplyIntField(g_editTurnRun, gs::set_page_turn_run_ms, 100, 600000); return 0; }
             if (code == EN_KILLFOCUS && ctl == g_editTurnRun) { CommitIntField(g_editTurnRun, gs::set_page_turn_run_ms, 100, 600000, L"转动时长(ms)"); return 0; }
             if (code == CBN_SELCHANGE && id == IDC_COMBO_ORIENT) {

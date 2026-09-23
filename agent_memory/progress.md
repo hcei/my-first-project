@@ -7,8 +7,8 @@
 ## 当前任务
 **（已实现·编译+启动+正常关闭全通过·待真机闭环验收）蓝牙翻页接入（2026-09-20/21）**：把 `Run()` 里的预留锚点换成真信号实现 —— 每页写完发 `RUN<档位>,<时长>` 给 STM32+TB6612+直流电机，**等板子回 `DONE`** 才算翻页成功（闭环，不是定时器猜）。用户四项决策：①翻页机构就用「STM32+TB6612+直流电机」那套；②完成判定必须闭合环（要回位信号），板子回「转完了」即可，不加位置传感器；③链路方法不限但**要集成进 GUI**；④翻页参数（档位/时长）做成 **GUI 上可调**。
 - 新增 `ble_motor.{h,cpp}`（唯一新文件，未改 hanzi/motion/serial_port/gui_trail 的内核逻辑）：**纯 WinRT** 实现 BLE GATT 透传。单工作线程独占 WinRT（进 MTA），对外只暴露 `exec(line, want, timeout, canceled, got, err)` 阻塞式闭环调用 + 状态查询/连接控制。链路：`BluetoothLEDevice.FromBluetoothAddressAsync` → `GetGattService(FFE0)` → `IGattDeviceService3`（RequestAccessAsync + **OpenAsync(SharedReadAndWrite)**）→ `GetCharacteristicsWithCacheModeAsync(**Uncached**)` → FFE1 → `add_ValueChanged` + `WriteClientCharacteristicConfigurationDescriptorWithResultAsync(Notify)`；写用 `IGattCharacteristic3::WriteValueWithResultAsync`。
-- `gui_service.{h,cpp}`：`page_turn_install()` 注册回调（`Run()` 里 `cfg_load()` 之后调用，替换原锚点注释）；回调内「确保链路（未连接则自动建链，最多等 40s）→ 发 RUN → 等 DONE」，**回调不持 g_mu**（调用点本就无锁），所以长阻塞不会卡 UI；取消语义沿用 `g_task_cancel||g_estop`，命中立即放弃。新增 4 个持久化配置键 `page_turn_ble/page_turn_gear(0~50,默认30)/page_turn_run_ms(100~600000,默认3000)/ble_addr(默认21F6473AD889)` + setter/getter + snapshot 暴露 + 审计事件 `page_turn_ble`（含 cmd/gear/run_ms/result/elapsed_ms/detail）。`page_turn_shutdown()` 退出时断开 GATT + 停工作线程。
-- `gui_win32.cpp`：翻页条下新增第二行「[✓]蓝牙翻页　档位(0~50)：[ ]　时长(ms)：[ ]　[连接蓝牙]　状态文本」。档位/时长沿用**两段式整数框**（EN_CHANGE 合法即套用不回写、KILLFOCUS 夹取回写，同字号/每页字数教训）；`WritePlotGeo` 新增 `strip2` 几何并把下方四角标定区整行下移（避免盖住）；新增复选框必须紧邻 `IDC_CHECK_*` 块（按 `id-IDC_CHECK_DRY` 索引）；`IDC_BTN_BLECONN` 加入 `DrawBtn` 的 TEAL 组；`WM_DESTROY` 里调 `gs::page_turn_shutdown()`。
+- `gui_service.{h,cpp}`：`page_turn_install()` 注册回调（`Run()` 里 `cfg_load()` 之后调用，替换原锚点注释）；回调内「确保链路（未连接则自动建链，最多等 40s）→ 发 RUN → 等 DONE」，**回调不持 g_mu**（调用点本就无锁），所以长阻塞不会卡 UI；取消语义沿用 `g_task_cancel||g_estop`，命中立即放弃。新增 4 个持久化配置键 `page_turn_ble/page_turn_gear(0~20,默认15)/page_turn_run_ms(100~600000,默认3000)/ble_addr(默认21F6473AD889)` + setter/getter + snapshot 暴露 + 审计事件 `page_turn_ble`（含 cmd/gear/run_ms/result/elapsed_ms/detail）。`page_turn_shutdown()` 退出时断开 GATT + 停工作线程。
+- `gui_win32.cpp`：翻页条下新增第二行「[✓]蓝牙翻页　档位(0~20)：[ ]　时长(ms)：[ ]　[连接蓝牙]　状态文本」。档位/时长沿用**两段式整数框**（EN_CHANGE 合法即套用不回写、KILLFOCUS 夹取回写，同字号/每页字数教训）；`WritePlotGeo` 新增 `strip2` 几何并把下方四角标定区整行下移（避免盖住）；新增复选框必须紧邻 `IDC_CHECK_*` 块（按 `id-IDC_CHECK_DRY` 索引）；`IDC_BTN_BLECONN` 加入 `DrawBtn` 的 TEAL 组；`WM_DESTROY` 里调 `gs::page_turn_shutdown()`。
 - `build.bat`：`COMMON` 加 `ble_motor.cpp`；两个目标都加 `-lruntimeobject -lwindowsapp -lole32 -luuid`（WinRT 需要；控制台目标之前没有任何 -l，同样要加）。
 - 验证：两个目标 g++ 链接 **RC=0**（只剩改动前就有的 `g_auto_draw_used`/`shanshui_gen.hpp` 警告）；`RobotGUI.exe` 启动冒烟「已加载配置 robot_config.json」且 8s 存活；用 `CloseMainWindow()` 发 WM_CLOSE 走**正常关闭路径**，进程 4s 内退出、**无 terminate/崩溃**。另有独立验收工具 `ble_selftest.exe`（在 workspace `tmp/ble_poc/`，链工程内 `ble_motor.cpp`），可在不开 GUI 的情况下单独跑「建链→发 RUN→收 DONE」。
 - **✓ 真机闭环验收已通过（2026-09-21 20:35）**：模块上电后 `scan.py` 15s 扫描到 `21:F6:47:3A:D8:89  rssi=-65  HC-05`，随即 `ble_selftest.exe` 一次跑通：**建链 2.30 s → 发 `RUN30,3000` → 3.33 s 后收到 `DONE 30 3000`，EXIT=0**（电机实际转了 3 秒）。**「模块不可达 = 没上电」的结论被验证实**，软件侧零改动即通。顺带印证：模块在广播时建链只要 **2.3 s**（昨天不可达时是 25 s 后失败），所以「**连不上先扫描**」这条方法论成立。剩余待办只有 GUI 整任务验收与手感标定。
@@ -144,6 +144,14 @@
 
 - 2026-09-20（深夜·本窗口）：蓝牙翻页闭环验收**把失败根因定位到硬件**。关掉用户的 `motor_ble_gui.py`(PID 12428) 后复验，`OpenAsync` 由 `SharingViolation(4)` 变为 `Success(1)`（证明该工具确实是之前的占用者），但**仍失败**：特征枚举 `GattCommunicationStatus=1 Unreachable`、每次耗时 7.75s；`bleak` 主动扫描两次都扫不到模块；新诊断 `[link=0 ...]` 说明 PC 侧**根本没有链路**（排除幽灵链路）。→ **结论：模块在空口上不可达 = 没上电（或正被手机占着）；非软件问题**。同时修掉代码诊断盲点：`ble_motor.cpp` 原先把 `Unreachable` 笼统报成“找不到 FFE1 特征（模块未就绪或服务未广播）”，现按状态码分诊并附 `[link= open= comm= n=]`；新建 `tmp/ble_poc/scan.py`（bleak 扫描）作为“硬件在不在”的第一个检查项。`ble_selftest.exe` 重新编译 **RC=0**（逻辑未改，仅加诊断）。改动文件：`ble_motor.cpp`（仅诊断）。**未改**任何 GPIO/写字节/时序/协议代码。
 - 2026-09-21：**蓝牙翻页真机闭环验收通过**。用户给模块上电后，`scan.py` 立即扫到目标（`rssi=-65`），`ble_selftest.exe` 一次跑通：建链 2.30s → `RUN30,3000` → 3.33s 收到 `DONE 30 3000`（EXIT=0，电机真转）。**证实 9-20 的定因正确（模块没上电），且从 9-20 到 9-21 软件侧一行未改即通**。对照数据：可达时建链 2.3s，不可达时要空等 25s 才报错 —— 可用于快速判断模块在不在。代码侧本轮无改动（只跑验收 + 更新记录）。
+- 2026-09-23（跨工程）：**下位机档位总数 50 → 20**（另一侧工程 `桌面\电机代码` 把执行器由 130 电机换成 TT 减速电机）。本工程同步三处，否则**自动翻页会静默失效**：
+  ① `gui_service.h` 新增 `constexpr int PAGE_TURN_GEAR_MAX = 20;`，`set_page_turn_gear()` 校验与 `cfg_load()` 迁移校验改用该常量（原为散落的 `gear > 50` / `v <= 50`，现只有一处定义）；
+  ② 默认翻页档位 `g_page_turn_gear` 与输入框初值 30 → **15**（30 > 20 会被板子越界拒掉）；
+  ③ `gui_win32.cpp` 两处夹取范围 `0, 50` → `0, PAGE_TURN_GEAR_MAX`，界面文案「档位(0~50)：」改为按常量动态拼出；
+  ④ `robot_config.json` 的 `page_turn_gear` 30 → 15。
+  **起因**：板子固件有 `if (GearVal > MOTOR_GEAR_MAX) → 回 ERR` 的越界检查，而本工程原校验是 `0~50` **不会当场拦**，表现只是"写到页末翻页没反应"，极难查。
+  验证：`g++` 全量重编 `exit=0`（仅剩 1 个原有的 unused-variable 警告）；用户原 `RobotGUI.exe` 未被覆盖。
+
 ## 验证说明
 - 已验证：GUI 预检/开始书写/停止三条操作路径的审计事件落盘正确；控制台 DRYRUN 帧序列与拆分前基线逐帧一致；`build.bat` 一次产出两个 exe 并冒烟通过。
 - 已验证（2026-09-18）：三页截图三张互不相同且逐页目视检查通过；GUI 预检再次实测 `task_preflight result=ok`。本轮只改 `gui_win32.cpp`（`git status` 仅此一个文件），未触及控制台与共享服务层，故未重跑帧级回归。

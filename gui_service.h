@@ -141,11 +141,16 @@ int  page_turn_wait_ms();
 // —— 蓝牙翻页（2026-09-21 接入，见 ble_motor.h）—— //
 // 真信号 = 板子回 DONE（闭合环，不是定时器猜）。链路 = BLE GATT 透传（FFE0/FFE1）。
 // 三个参数都做成 GUI 可调并持久化；关闭蓝牙翻页时自动回退到上面的模拟等待。
+//
+// ★翻页档位上限 PAGE_TURN_GEAR_MAX：必须与下位机固件 Hardware/Motor.h 的
+//   MOTOR_GEAR_MAX 保持一致，改一处就得同步改另一处。
+//   2026-09-23：执行器电机由 130 换成 TT 减速电机(1:48)，档位总数 50 -> 20。
+constexpr int PAGE_TURN_GEAR_MAX = 20;
 void page_turn_install();                  // 注册翻页回调（Run() 启动时调一次即可）
 void page_turn_shutdown();                 // 退出前优雅收尾（断开 GATT + 停工作线程）
 bool set_page_turn_ble(bool on);           // 启用/停用蓝牙翻页（持久化）
 bool page_turn_ble();
-bool set_page_turn_gear(int gear);         // 档位 0~50（持久化）
+bool set_page_turn_gear(int gear);         // 档位 0~PAGE_TURN_GEAR_MAX（持久化）
 int  page_turn_gear();
 bool set_page_turn_run_ms(int ms);         // 每次转动时长 100~600000ms（持久化）
 int  page_turn_run_ms();

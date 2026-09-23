@@ -100,7 +100,7 @@ PageTurnFn g_page_turn;   // 空 = 默认模拟等待（调用处兜底 page_tur
 // —— 蓝牙翻页参数（2026-09-21 接入；随 robot_config.json 持久化）—— //
 // 真信号 = 板子回 DONE，闭合环。关闭开关时回退到 g_page_turn_wait_ms 模拟等待。
 bool        g_page_turn_ble    = false;      // 启用蓝牙翻页
-int         g_page_turn_gear   = 30;         // 档位 0~50（占空比由板子换算）
+int         g_page_turn_gear   = 15;         // 档位 0~PAGE_TURN_GEAR_MAX（占空比由板子换算）
 int         g_page_turn_run_ms = 3000;       // 每次转动时长 ms
 std::string g_ble_addr         = "21F6473AD889";   // 模块蓝牙地址（12 位十六进制）
 bool        g_ble_inited       = false;      // ble_motor 是否已 start()
@@ -1129,7 +1129,7 @@ bool page_turn_ble() { return g_page_turn_ble; }
 
 bool set_page_turn_gear(int gear) {
     if (g_task_active) return false;
-    if (gear < 0 || gear > 50) return false;
+    if (gear < 0 || gear > PAGE_TURN_GEAR_MAX) return false;
     g_page_turn_gear = gear;
     cfg_save();
     return true;
@@ -1688,7 +1688,7 @@ void cfg_load() {
             g_page_turn_ble = j["page_turn_ble"].get<bool>();
         if (j.contains("page_turn_gear") && j["page_turn_gear"].is_number_integer()) {
             int v = j["page_turn_gear"].get<int>();
-            if (v >= 0 && v <= 50) g_page_turn_gear = v;
+            if (v >= 0 && v <= PAGE_TURN_GEAR_MAX) g_page_turn_gear = v;
         }
         if (j.contains("page_turn_run_ms") && j["page_turn_run_ms"].is_number_integer()) {
             int v = j["page_turn_run_ms"].get<int>();
