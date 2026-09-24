@@ -32,7 +32,7 @@
   "enable_dip": false,
   "enable_dunbi": false,
   "free_char_size": 90.0,
-  "glyph_orient": 3,
+  "glyph_orient": 0,
   "high_quality": true,
   "ink": [
     0.0,
@@ -50,49 +50,36 @@
     {
       "cells": [
         {
-          "x": 65.88784790039063,
+          "x": -127.9565200805664,
           "y": -45.0
         },
         {
-          "x": -41.63551330566406,
-          "y": -45.0
-        },
-        {
-          "x": -147.01869201660156,
+          "x": 27.956527709960938,
           "y": -45.0
         }
       ],
-      "text": "欲穷千"
+      "text": "溪来"
     },
     {
-      "cells": [
-        {
-          "x": 32.364479064941406,
-          "y": -45.0
-        },
-        {
-          "x": -113.39253997802734,
-          "y": -45.0
-        }
-      ],
-      "text": "里目"
+      "cells": [],
+      "text": ""
     }
   ],
-  "page_chars": 3,
+  "page_chars": 7,
   "page_count": 2,
-  "page_text": "欲穷千里目",
-  "page_text_full": "欲穷千里目",
+  "page_text": "溪来",
+  "page_text_full": "溪来",
   "page_turn_wait_ms": 3000,
   "point_fixed_curve_ms": 25,
   "point_fixed_ms": 85,
   "rdp_tol_curve_mm": 0.10000000149011612,
   "rdp_tol_mm": 2.0999999046325684,
-  "speed": 1,
+  "speed": 3,
   "stroke_begin_ms": 0,
   "stroke_end_ms": 0,
   "write_dir": 1,
   "writing_plane_valid": true,
-  "writing_plane_z": -351.0,
+  "writing_plane_z": -350.0,
   "z_layers": [
     -325.0,
     -350.0,
@@ -106,5 +93,5 @@
     -410.0
   ],
   "z_offset": 0.0,
-  "z_settle_ms": 82
+  "z_settle_ms": 250
 }

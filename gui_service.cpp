@@ -1068,6 +1068,12 @@ bool set_z_settle_ms(int ms) {
     g_z_settle_ms = ms; cfg_save(); return true;   // 直设，不调 sync_z_settle（否则被 107-min(C直,C弯) 覆盖）
 }
 int z_settle_ms() { return g_z_settle_ms; }
+bool set_stroke_begin_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 3000) return false;
+    g_stroke_begin_ms = ms; cfg_save(); return true;   // 直设；笔画起点驻留，不进 sync_z_settle（不联动 z_settle/C）
+}
+int stroke_begin_ms() { return g_stroke_begin_ms; }
 
 // 实时排版预览：不写审计；据当前文本重切页（文本未变的页保留拖拽坐标），
 // 返回【当前编辑页】的叠画字块与分页信息，供 GUI 书写页画布/翻页条即时刷新。
@@ -1206,12 +1212,17 @@ static void run_task_thread(std::string text) {
             }
             task::traj_add_total(one.size());
 
-            // 每页首字：先抬笔预定位到该字起点上方（页与页之间同样需要，翻页后从纸上空白区起步）
-            if (ci == 0) {
+            // 每个字都先抬笔预定位到该字起点上方。
+            // D1：原来只有每页首字(ci==0)预定位；非首字的"字首大跳"因 transmitTrajectoryWithSplit
+            // 每字独立调用、首点 lastSent=null ⇒ 只拿到 cold_start 地板(150ms)，落笔命令抢占
+            // 未走完的抬笔定位 → 首笔丢墨（真机「来」第一笔实证）。改为每字都走真实行程预算。
+            // ⚠ guard 耦合：move_up_to_and_wait 的 guard=(dxy>20?600:250)+get_Z_SETTLE_MS()，
+            //   现 z_settle=250 使 guard 比早期(27)大 ~223ms；日后若调低 z_settle，预定位余量会同步缩小，需复核。
+            {
                 Point firstUp = one.front();
                 firstUp.z = Z_UP;
                 firstUp.isPenDown = false;
-                firstUp.zType = "UP-FIRST-ANCHOR";
+                firstUp.zType = (ci == 0) ? "UP-FIRST-ANCHOR" : "UP-CHAR-ANCHOR";
                 if (!move_up_to_and_wait(g_port, firstUp, true)) { end_task(false, "failed", "prepos"); return; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(g_enableDip ? 400 : 200));
             }

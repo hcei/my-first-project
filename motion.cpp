@@ -308,10 +308,19 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
                     // angle_between 返回【内角】：直段续接=π(180°)、真拐角=π/2、发夹≈0。
                     // 旧判据 ang>θ 会把 +停顿打在【直线点】上(100% 命中)、反而漏掉真发夹——逻辑反了。
                     // 正确：用【转折角】turn = π - ang，只在方向真的改变处停顿。（此停顿与 estimateMoveMs 的 C 同批引入）
-                    float ang = angle_between(filtered[k - 1], filtered[k], filtered[k + 1]);
-                    float turn = 3.1415926f - ang;
-                    if (turn > corner_theta_rad) corner_extra = hard_corner_ms;
-                    else if (turn > corner_theta_rad * 0.6f) corner_extra = corner_dwell_ms;
+                    // R5：退化角修正——每个笔画的下降点 down@p0 的前一点是同 XY 的抬笔点 UP@p0，
+                    // |Δxy|≈0 使 angle_between 返回 0 ⇒ turn=π 被误判成硬拐角 ⇒ 每个起笔白拿 +80ms
+                    // （起笔静压≈340ms、墨团偏大）。仅当前后两段 XY 都足够长(>0.5mm)时才计算转角。
+                    float px = filtered[k].x - filtered[k - 1].x, py = filtered[k].y - filtered[k - 1].y;
+                    float nx = filtered[k + 1].x - filtered[k].x, ny = filtered[k + 1].y - filtered[k].y;
+                    float len_prev = std::sqrt(px * px + py * py);
+                    float len_next = std::sqrt(nx * nx + ny * ny);
+                    if (len_prev > 0.5f && len_next > 0.5f) {
+                        float ang = angle_between(filtered[k - 1], filtered[k], filtered[k + 1]);
+                        float turn = 3.1415926f - ang;
+                        if (turn > corner_theta_rad) corner_extra = hard_corner_ms;
+                        else if (turn > corner_theta_rad * 0.6f) corner_extra = corner_dwell_ms;
+                    }
                 }
 
                 wait_after_send(t0, interval_for(lastSent, p, true, corner_extra));

@@ -147,6 +147,8 @@ bool set_rdp_tol_curve_mm(float mm);       // 曲线段 RDP 抽稀容差(mm) 0.0
 float rdp_tol_curve_mm();
 bool set_z_settle_ms(int ms);              // Z 过渡沉降时间(ms) 0~3000；直设不调 sync_z_settle，但改任一 C 框会被重配平为 107-min(C直,C弯)
 int  z_settle_ms();
+bool set_stroke_begin_ms(int ms);          // 笔画起点(落笔)额外驻留(ms) 0~3000；直设、不进 sync_z_settle 配平（与 R5 去掉的伪 80ms 同位，供"封口/粘连"双赢调参）
+int  stroke_begin_ms();
 bool preview_writing_plane(float z, std::string& err);  // 移到 (0,0,z) 悬停，确认书写高度（不书写）
 bool set_writing_plane(float z, std::string& err);      // 保存书写平面 Z：生效 + 持久化（后续书写统一用该 Z）
 // —— 四角标定（实时轨迹面板）：预览=抬笔移到该角(真机移动)；保存=固定并持久化；清除=复位 —— //
