@@ -433,6 +433,8 @@ json snapshot() {
         { "layout_row_spacing", g_lm_row_spacing }, { "write_dir", g_write_dir },
         { "free_char_size", g_free_char_size }, { "glyph_orient", g_glyph_orient },
         { "page_chars", g_page_chars }, { "page_count", g_page_count },
+        { "point_fixed_ms", g_point_fixed_ms }, { "point_fixed_curve_ms", g_point_fixed_curve_ms },
+        { "rdp_tol_mm", g_rdp_tol_mm }, { "rdp_tol_curve_mm", g_rdp_tol_curve_mm },
         { "edit_page", g_edit_page }, { "page_turn_wait_ms", g_page_turn_wait_ms },
         { "page_turn_ble", g_page_turn_ble }, { "page_turn_gear", g_page_turn_gear },
         { "page_turn_run_ms", g_page_turn_run_ms }, { "ble_addr", g_ble_addr },
@@ -1189,6 +1191,49 @@ void ble_disconnect() {
     if (g_ble_inited) blem::request_disconnect();
 }
 
+// —— 实时调参：落笔每点固定开销 C 与 RDP 抽稀容差，各分【直线段(横/竖)】/【曲线段(撇/捺/弯钩)】两组 —— //
+// 改任一 C 时把 z_settle 配平成 107 - min(C直,C弯)，保证两组 Z 过渡预算(C+z_settle)都 ≥107ms（Phase1 静压、不炸毛/不欠压）。
+static void sync_z_settle() {
+    int cmin = std::min(g_point_fixed_ms, g_point_fixed_curve_ms);
+    int zs = 107 - cmin; if (zs < 0) zs = 0; if (zs > 3000) zs = 3000;
+    g_z_settle_ms = zs;
+}
+bool set_point_fixed_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 300) return false;
+    g_point_fixed_ms = ms; sync_z_settle(); cfg_save(); return true;
+}
+int point_fixed_ms() { return g_point_fixed_ms; }
+bool set_point_fixed_curve_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 300) return false;
+    g_point_fixed_curve_ms = ms; sync_z_settle(); cfg_save(); return true;
+}
+int point_fixed_curve_ms() { return g_point_fixed_curve_ms; }
+bool set_rdp_tol_mm(float mm) {
+    if (g_task_active) return false;
+    if (mm < 0.02f || mm > 3.0f) return false;
+    g_rdp_tol_mm = mm; cfg_save(); return true;
+}
+float rdp_tol_mm() { return g_rdp_tol_mm; }
+bool set_rdp_tol_curve_mm(float mm) {
+    if (g_task_active) return false;
+    if (mm < 0.02f || mm > 3.0f) return false;
+    g_rdp_tol_curve_mm = mm; cfg_save(); return true;
+}
+float rdp_tol_curve_mm() { return g_rdp_tol_curve_mm; }
+bool set_z_settle_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 3000) return false;
+    g_z_settle_ms = ms; cfg_save(); return true;   // 直设，不调 sync_z_settle（否则被 107-min(C直,C弯) 覆盖）
+}
+int z_settle_ms() { return g_z_settle_ms; }
+bool set_stroke_begin_ms(int ms) {
+    if (g_task_active) return false;
+    if (ms < 0 || ms > 3000) return false;
+    g_stroke_begin_ms = ms; cfg_save(); return true;   // 直设；笔画起点驻留，不进 sync_z_settle（不联动 z_settle/C）
+}
+int stroke_begin_ms() { return g_stroke_begin_ms; }
 
 // 实时排版预览：不写审计；据当前文本重切页（文本未变的页保留拖拽坐标），
 // 返回【当前编辑页】的叠画字块与分页信息，供 GUI 书写页画布/翻页条即时刷新。
@@ -1327,12 +1372,17 @@ static void run_task_thread(std::string text) {
             }
             task::traj_add_total(one.size());
 
-            // 每页首字：先抬笔预定位到该字起点上方（页与页之间同样需要，翻页后从纸上空白区起步）
-            if (ci == 0) {
+            // 每个字都先抬笔预定位到该字起点上方。
+            // D1：原来只有每页首字(ci==0)预定位；非首字的"字首大跳"因 transmitTrajectoryWithSplit
+            // 每字独立调用、首点 lastSent=null ⇒ 只拿到 cold_start 地板(150ms)，落笔命令抢占
+            // 未走完的抬笔定位 → 首笔丢墨（真机「来」第一笔实证）。改为每字都走真实行程预算。
+            // ⚠ guard 耦合：move_up_to_and_wait 的 guard=(dxy>20?600:250)+get_Z_SETTLE_MS()，
+            //   现 z_settle=250 使 guard 比早期(27)大 ~223ms；日后若调低 z_settle，预定位余量会同步缩小，需复核。
+            {
                 Point firstUp = one.front();
                 firstUp.z = Z_UP;
                 firstUp.isPenDown = false;
-                firstUp.zType = "UP-FIRST-ANCHOR";
+                firstUp.zType = (ci == 0) ? "UP-FIRST-ANCHOR" : "UP-CHAR-ANCHOR";
                 if (!move_up_to_and_wait(g_port, firstUp, true)) { end_task(false, "failed", "prepos"); return; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(g_enableDip ? 400 : 200));
             }
@@ -1361,21 +1411,27 @@ static void run_task_thread(std::string text) {
             }
         }   // ← 本页逐字循环结束
 
+        // ★页尾自动复位（抬笔）：本页写完即在最末落笔点原位抬笔并短驻，每页（含末页）必有。
+        //   字形轨迹末点虽已是 UP-ENDCHAR，此处仍显式再发一次 Z_UP 作确认复位，保证页尾
+        //   最后一笔书写与后续补蘸/翻页拖纸之间笔一定抬起；放在补蘸之前，抬笔不被后续动作替代。
+        //   非末页翻页前的抬笔（原 UP-PAGETURN）已并入本动作，避免同页重复抬笔。
+        {
+            Point resetUp = Point{ g_last_pose.x, g_last_pose.y, Z_UP, false,
+                                   (uint8_t)SPEED_LEVEL, "UP-PAGEEND" };
+            g_port.sendPointRetry(resetUp);
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));   // 页尾短驻
+        }
+
         // 页尾补蘸：全局计数不满 5 的倍数且后面还有页要写（保持原“书写结束前至少一次蘸墨”语义）
         if (g_enableDip && gci % 5 != 0 && pi + 1 < nPages) {
             task::stage("蘸墨");
             if (!do_dip_and_groom(g_port, g_ink)) { end_task(false, "failed", "dip"); return; }
         }
 
-        // —— 翻页（仅非末页）：抬笔 → 通知 GUI 切页 → 蓝牙信号(当前为模拟等待) → 清轨迹 —— //
+        // —— 翻页（仅非末页）：通知 GUI 切页 → 蓝牙信号(当前为模拟等待) → 清轨迹（抬笔已在页尾 UP-PAGEEND 完成） —— //
         if (pi + 1 < nPages) {
             {
                 std::lock_guard<std::recursive_mutex> lk(g_mu);
-                // 抬笔到当页末字正上方，避免拖纸时笔尖蹭纸
-                const Offset& lastOfs = plan.offsets.back();
-                Point up = Point{ lastOfs.x + S / 2, lastOfs.y + S / 2, Z_UP, false,
-                                  (uint8_t)SPEED_LEVEL, "UP-PAGETURN" };
-                if (g_port.sendPointRetry(up)) task::traj_add_done(1, false);
                 session_id();
                 json ev = op_event("page_turn", nullptr);
                 ev["parameters"] = { { "turn_to_page", pi + 2 }, { "page_total", nPages },
@@ -1555,6 +1611,10 @@ bool cfg_save() {
     j["stroke_end_ms"]         = g_stroke_end_ms;
     j["cold_start_min_ms"]     = g_cold_start_min_ms;
     j["min_point_interval_ms"] = g_min_point_interval_ms;
+    j["point_fixed_ms"]        = g_point_fixed_ms;
+    j["point_fixed_curve_ms"]  = g_point_fixed_curve_ms;
+    j["rdp_tol_mm"]            = g_rdp_tol_mm;
+    j["rdp_tol_curve_mm"]      = g_rdp_tol_curve_mm;
     j["writing_plane_z"]       = g_writing_plane_z;
     j["writing_plane_valid"]   = g_writing_plane_valid;
     j["layout_mode"]           = g_layout_mode;
@@ -1625,11 +1685,22 @@ void cfg_load() {
                 if (!j.contains(k) || !j[k].is_number()) return cur;
                 return clampi(j[k].get<long long>(), 0, 3000);
                 };
+            auto getf = [&](const char* k, float cur)->float{
+                if (!j.contains(k) || !j[k].is_number()) return cur;
+                double v = j[k].get<double>();
+                if (!std::isfinite(v)) return cur;
+                if (v < 0.02) v = 0.02; if (v > 3.0) v = 3.0f;
+                return (float)v;
+                };
             g_z_settle_ms           = geti("z_settle_ms",           g_z_settle_ms);
             g_stroke_begin_ms       = geti("stroke_begin_ms",       g_stroke_begin_ms);
             g_stroke_end_ms         = geti("stroke_end_ms",         g_stroke_end_ms);
             g_cold_start_min_ms     = geti("cold_start_min_ms",     g_cold_start_min_ms);
             g_min_point_interval_ms = geti("min_point_interval_ms", g_min_point_interval_ms);
+            g_point_fixed_ms        = geti("point_fixed_ms",        g_point_fixed_ms);
+            g_point_fixed_curve_ms  = geti("point_fixed_curve_ms",  g_point_fixed_curve_ms);
+            g_rdp_tol_mm            = getf("rdp_tol_mm",            g_rdp_tol_mm);
+            g_rdp_tol_curve_mm      = getf("rdp_tol_curve_mm",      g_rdp_tol_curve_mm);
         }
         if (j.contains("writing_plane_z") && j["writing_plane_z"].is_number()) {
             float z = j["writing_plane_z"].get<float>();

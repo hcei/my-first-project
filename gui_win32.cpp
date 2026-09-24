@@ -63,7 +63,7 @@ static const int INFO_ROW_MAX = 44;    // 设备信息行距上限（多余高�
 static const int INFO_LABEL_W = 88;    // 设备信息标签列宽（容纳 4 字标签）
 static const int INFO_VALUE_DX = 94;   // 设备信息值列相对标签起点的偏移
 static const int CONNECT_PANEL_H = 246;// 连接页面板高度
-static const int WRITE_PANEL_H = 346;  // 书写页面板高度（字号+朝向+分页+操作+状态，画布更大便于拖拽）
+static const int WRITE_PANEL_H = 444;  // 书写页面板高度（字号+朝向+分页+四行调参[C直/弯·抽稀直/弯·Z沉降·起笔ms]+操作+状态）
 static const int PLANE_PANEL_H = 280;  // 书写平面页面板高度
 static const int BTN_H = 40, BTN_PITCH = 52;
 static const int CHK_H = 24, CHK_PITCH = 30;
@@ -198,6 +198,7 @@ enum {
     IDC_COMBO_ORIENT, IDC_BTN_RESETCANVAS,
     IDC_EDIT_PAGECH, IDC_EDIT_PGCNT, IDC_EDIT_TURNWAIT, IDC_BTN_PAGE_PREV, IDC_BTN_PAGE_NEXT,
     IDC_EDIT_TURNGEAR, IDC_EDIT_TURNRUN, IDC_BTN_BLECONN,   // ★蓝牙翻页：档位 / 时长 / 连接
+    IDC_EDIT_PFIX, IDC_EDIT_RDP, IDC_EDIT_PFIX_CURVE, IDC_EDIT_RDP_CURVE, IDC_EDIT_ZSETTLE, IDC_EDIT_STROKE_BEGIN,
     ID_PAGE_HOME = 2001, ID_PAGE_CONNECT, ID_PAGE_WRITE, ID_PAGE_PLANE,
     IDT_TIMER = 3001,
 };
@@ -235,6 +236,12 @@ static HWND g_editPgCnt    = nullptr;   // 总页数输入框
 static HWND g_editTurnWait = nullptr;   // 翻页模拟等待 ms 输入框（轨迹面板翻页条内）
 static HWND g_editTurnGear = nullptr;   // ★蓝牙翻页：档位输入框 0~gs::PAGE_TURN_GEAR_MAX
 static HWND g_editTurnRun  = nullptr;   // ★蓝牙翻页：每次转动时长 ms
+static HWND g_editPFix     = nullptr;   // 落笔每点固定开销 C(ms) 输入框（改动自动配平 z_settle=107-C）
+static HWND g_editRDP      = nullptr;   // 书法段 RDP 抽稀容差(mm) 输入框
+static HWND g_editPFixC    = nullptr;   // 曲线段(撇/捺/弯钩) 落笔C(ms) 输入框
+static HWND g_editRDPC     = nullptr;   // 曲线段 RDP 抽稀容差(mm) 输入框
+static HWND g_editZSettle  = nullptr;   // Z 过渡沉降时间(ms) 输入框（手动直设；改任一 C 框会被 sync_z_settle 重配平）
+static HWND g_editStrokeBegin = nullptr; // 笔画起点(落笔)额外驻留(ms) 输入框（实时改，替代手改 config；与 R5 去掉的伪 80ms 同位）
 static HWND g_stcTrunc     = nullptr;   // 截断提示文本（超容量时显示）
 // 分页缓存（UI 线程；RefreshLayoutPreview 更新）：编辑页/总页数/本次要写页数/页内是否有字
 static int  g_pgEdit = 0, g_pgTotal = 0, g_pgWritten = 0;
@@ -621,8 +628,11 @@ struct WriteLayoutGeo {
     int row3Y;                              // 每页字数 / 总页数 行
     int pcLabW, pcEdX, pcEdW;               // “每页字数”标签 + 输入框
     int pnLabX, pnLabW, pnEdX, pnEdW;       // “总页数”标签 + 输入框
-    int actionY;                            // 预检 / 开始 / 停止 行
-    int statusY, statusH;                   // 只读状态框
+    int row4Y, row5Y, row6Y, row7Y;            // 落笔C(直/弯) 行、抽稀(直/弯) 行、Z沉降 行、起笔ms 行
+    int c1LabW, c1EdX, c1EdW;                 // 每行第一列：标签宽 + 输入框
+    int c2LabX, c2LabW, c2EdX, c2EdW;         // 每行第二列
+    int actionY;                              // 预检 / 开始 / 停止 行
+    int statusY, statusH;                     // 只读状态框
 };
 static WriteLayoutGeo WLGeo(const RECT& rc) {
     TwoColGeo g = TwoColLayout(rc, WRITE_PANEL_H);
@@ -638,8 +648,15 @@ static WriteLayoutGeo WLGeo(const RECT& rc) {
     L.pcLabW = 84; L.pcEdW = 44; L.pcEdX = g.innerX + L.pcLabW;
     L.pnLabX = L.pcEdX + L.pcEdW + 24; L.pnLabW = 60;
     L.pnEdX = L.pnLabX + L.pnLabW; L.pnEdW = 44;
-    L.actionY = g.top + 190;
-    L.statusY = g.top + 244;
+    L.row4Y = g.top + 186;
+    L.row5Y = g.top + 216;
+    L.row6Y = g.top + 246;
+    L.row7Y = g.top + 276;
+    L.c1LabW = 78; L.c1EdW = 46; L.c1EdX = g.innerX + L.c1LabW;
+    L.c2LabX = L.c1EdX + L.c1EdW + 14; L.c2LabW = 78;
+    L.c2EdX = L.c2LabX + L.c2LabW; L.c2EdW = 46;
+    L.actionY = g.top + 312;
+    L.statusY = g.top + 352;
     L.statusH = (g.top + g.panelH - PANEL_PAD) - L.statusY; if (L.statusH < 40) L.statusH = 40;
     return L;
 }
@@ -900,6 +917,16 @@ static void DrawWrite(HDC dc, RECT& rc) {
     Text(dc, L"书写方向", L.orLabX, L.row2Y + 3, L.orLabW, 22, INK, 14, true);
     Text(dc, L"每页字数", L.innerX, L.row3Y + 3, L.pcLabW, 22, INK, 14, true);
     Text(dc, L"总页数", L.pnLabX, L.row3Y + 3, L.pnLabW, 22, INK, 14, true);
+    Text(dc, L"落笔C直", L.innerX,  L.row4Y + 3, L.c1LabW, 22, INK, 14, true);
+    Text(dc, L"落笔C弯", L.c2LabX,  L.row4Y + 3, L.c2LabW, 22, INK, 14, true);
+    Text(dc, L"抽稀·直", L.innerX,  L.row5Y + 3, L.c1LabW, 22, INK, 14, true);
+    Text(dc, L"抽稀·弯", L.c2LabX,  L.row5Y + 3, L.c2LabW, 22, INK, 14, true);
+    Text(dc, L"Z沉降ms", L.innerX,  L.row6Y + 3, L.c1LabW, 22, INK, 14, true);
+    Text(dc, L"（改C框会重配平）", L.c1EdX + L.c1EdW + 10, L.row6Y + 5,
+         (L.c2EdX + L.c2EdW) - (L.c1EdX + L.c1EdW + 10), 22, MUTED, 12);
+    Text(dc, L"起笔ms", L.innerX,  L.row7Y + 3, L.c1LabW, 22, INK, 14, true);
+    Text(dc, L"起点驻留·封口↔粘连", L.c1EdX + L.c1EdW + 10, L.row7Y + 5,
+         (L.c2EdX + L.c2EdW) - (L.c1EdX + L.c1EdW + 10), 22, MUTED, 12);
 
     Panel(dc, g.rightX, g.top, g.colW, g.panelH);
     Text(dc, L"任务进度", g.rightX + PANEL_PAD, g.top + 6, 300, 34, INK, 24, true);
@@ -1156,6 +1183,12 @@ static void DestroyPageControls(HWND hwnd) {
     g_editTurnWait = nullptr;
     g_editTurnGear = nullptr;
     g_editTurnRun = nullptr;
+    g_editPFix = nullptr;
+    g_editRDP = nullptr;
+    g_editPFixC = nullptr;
+    g_editRDPC = nullptr;
+    g_editZSettle = nullptr;
+    g_editStrokeBegin = nullptr;
     g_stcTrunc = nullptr;
     g_pgEdit = 0; g_pgTotal = 0; g_pgWritten = 0; g_pgPartial = true;
     g_prevCells.clear(); g_prevValid = false;
@@ -1293,6 +1326,38 @@ static void CreateWriteControls(HWND hwnd) {
                                   L.pnEdX, L.row3Y, L.pnEdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PGCNT, nullptr, nullptr);
     SendMessage(g_editPgCnt, WM_SETFONT, (WPARAM)g_font16, TRUE);
     SetWindowTextW(g_editPgCnt, std::to_wstring(snapI("cfg", "page_count", 1)).c_str());
+    // 第四/五行：落笔C 与 RDP 抽稀，各分【直=横/竖】【弯=撇/捺/弯钩】两组（实时旋钮；改任一 C 自动配平 z_settle=107-min(C直,C弯)）
+    // 预填一律读实时 getter，切页重建不丢值。
+    g_editPFix = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                 L.c1EdX, L.row4Y, L.c1EdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PFIX, nullptr, nullptr);
+    SendMessage(g_editPFix, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editPFix, std::to_wstring(gs::point_fixed_ms()).c_str());
+    g_editPFixC = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                  L.c2EdX, L.row4Y, L.c2EdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_PFIX_CURVE, nullptr, nullptr);
+    SendMessage(g_editPFixC, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editPFixC, std::to_wstring(gs::point_fixed_curve_ms()).c_str());
+    g_editRDP = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,   // 允许小数点
+                                L.c1EdX, L.row5Y, L.c1EdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_RDP, nullptr, nullptr);
+    SendMessage(g_editRDP, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editRDP, f1(gs::rdp_tol_mm(), 2).c_str());
+    g_editRDPC = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                                 L.c2EdX, L.row5Y, L.c2EdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_RDP_CURVE, nullptr, nullptr);
+    SendMessage(g_editRDPC, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editRDPC, f1(gs::rdp_tol_curve_mm(), 2).c_str());
+    g_editZSettle = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                    L.c1EdX, L.row6Y, L.c1EdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_ZSETTLE, nullptr, nullptr);
+    SendMessage(g_editZSettle, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editZSettle, std::to_wstring(gs::z_settle_ms()).c_str());
+    g_editStrokeBegin = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NUMBER,
+                                        L.c1EdX, L.row7Y, L.c1EdW, 26, hwnd, (HMENU)(INT_PTR)IDC_EDIT_STROKE_BEGIN, nullptr, nullptr);
+    SendMessage(g_editStrokeBegin, WM_SETFONT, (WPARAM)g_font16, TRUE);
+    SetWindowTextW(g_editStrokeBegin, std::to_wstring(gs::stroke_begin_ms()).c_str());
     // 截断提示（文本超容量时点亮，由 RefreshLayoutPreview 更新）
     g_stcTrunc = CreateWindowExW(0, L"STATIC", L"",
                                  WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP,
@@ -1493,6 +1558,27 @@ static void CommitIntField(HWND ed, std::function<bool(int)> setter, int lo, int
     SetWindowTextW(ed, std::to_wstring(eff).c_str());
     g_laySuppress = false;
     if (f != eff) SetResult(fmt(L"%s已限制在有效范围（%d~%d）。", name, lo, hi));
+}
+
+// 浮点版：EN_CHANGE 只在值合法时套用不回写；KILLFOCUS 才夹取回写（保留两位小数）。
+static void ApplyFloatField(HWND ed, std::function<bool(float)> setter, float lo, float hi) {
+    if (!ed || g_laySuppress) return;
+    std::wstring v = GetEditW(ed);
+    if (v.empty()) return;
+    float f = (float)std::wcstod(v.c_str(), nullptr);
+    if (f < lo || f > hi) return;
+    setter(f);
+}
+static void CommitFloatField(HWND ed, std::function<bool(float)> setter, float lo, float hi, const wchar_t* name) {
+    if (!ed) return;
+    std::wstring v = GetEditW(ed);
+    float f = v.empty() ? lo : (float)std::wcstod(v.c_str(), nullptr);
+    float eff = f < lo ? lo : (f > hi ? hi : f);
+    setter(eff);
+    g_laySuppress = true;
+    SetWindowTextW(ed, f1(eff, 2).c_str());
+    g_laySuppress = false;
+    if (f != eff) SetResult(fmt(L"%s已限制在有效范围（%.2f~%.2f）。", name, lo, hi));
 }
 
 // 实时刷新排版预览：任务运行中冻结（不改全局、不叠画）；否则据当前文本重算并缓存字块 + 回显状态
@@ -1865,7 +1951,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HWND ctl = (HWND)lp;
         // 排版实时预览：书写页编辑框 EN_CHANGE（输入即刷新），预填回环期忽略
         if (g_st.page == ID_PAGE_WRITE && !g_laySuppress) {
-            if (code == EN_CHANGE && ctl == g_editText) { RefreshLayoutPreview(); return 0; }
+            if (code == EN_CHANGE && ctl == g_editText) { gs::save_last_task_text(to_u8(GetEditW(g_editText))); RefreshLayoutPreview(); return 0; }
             if (code == EN_CHANGE && ctl == g_editCharSize) { ApplyCharSizeField(); RefreshLayoutPreview(); return 0; }
             if (code == EN_KILLFOCUS && ctl == g_editCharSize) { CommitCharSizeField(); RefreshLayoutPreview(); return 0; }
             if (code == EN_CHANGE && ctl == g_editPageCh)  { ApplyIntField(g_editPageCh, gs::set_page_chars, 1, 50); RefreshLayoutPreview(); return 0; }
@@ -1878,6 +1964,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (code == EN_KILLFOCUS && ctl == g_editTurnGear) { CommitIntField(g_editTurnGear, gs::set_page_turn_gear, 0, gs::PAGE_TURN_GEAR_MAX, L"档位"); return 0; }
             if (code == EN_CHANGE && ctl == g_editTurnRun) { ApplyIntField(g_editTurnRun, gs::set_page_turn_run_ms, 100, 600000); return 0; }
             if (code == EN_KILLFOCUS && ctl == g_editTurnRun) { CommitIntField(g_editTurnRun, gs::set_page_turn_run_ms, 100, 600000, L"转动时长(ms)"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editPFix)  { ApplyIntField(g_editPFix, gs::set_point_fixed_ms, 0, 300); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editPFix) { CommitIntField(g_editPFix, gs::set_point_fixed_ms, 0, 300, L"落笔C(ms)"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editRDP)   { ApplyFloatField(g_editRDP, gs::set_rdp_tol_mm, 0.02f, 3.0f); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editRDP) { CommitFloatField(g_editRDP, gs::set_rdp_tol_mm, 0.02f, 3.0f, L"抽稀容差(mm)"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editPFixC)  { ApplyIntField(g_editPFixC, gs::set_point_fixed_curve_ms, 0, 300); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editPFixC) { CommitIntField(g_editPFixC, gs::set_point_fixed_curve_ms, 0, 300, L"落笔C弯(ms)"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editRDPC)   { ApplyFloatField(g_editRDPC, gs::set_rdp_tol_curve_mm, 0.02f, 3.0f); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editRDPC) { CommitFloatField(g_editRDPC, gs::set_rdp_tol_curve_mm, 0.02f, 3.0f, L"抽稀弯容差(mm)"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editZSettle)  { ApplyIntField(g_editZSettle, gs::set_z_settle_ms, 0, 3000); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editZSettle) { CommitIntField(g_editZSettle, gs::set_z_settle_ms, 0, 3000, L"Z沉降(ms)"); return 0; }
+            if (code == EN_CHANGE && ctl == g_editStrokeBegin)  { ApplyIntField(g_editStrokeBegin, gs::set_stroke_begin_ms, 0, 3000); return 0; }
+            if (code == EN_KILLFOCUS && ctl == g_editStrokeBegin) { CommitIntField(g_editStrokeBegin, gs::set_stroke_begin_ms, 0, 3000, L"起笔(ms)"); return 0; }
             if (code == CBN_SELCHANGE && id == IDC_COMBO_ORIENT) {
                 int sel = (int)SendMessageW(g_comboOrient, CB_GETCURSEL, 0, 0);
                 if (gs::task_active()) {

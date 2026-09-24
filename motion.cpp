@@ -17,8 +17,8 @@
 
 // —— 降采样/抽稀步长 —— //
 // 方案B：书法段落笔点用 Ramer–Douglas–Peucker 按“最大弦高偏差”抽稀——
-//   直段塌成两端点（一笔到底、最顺滑），弯曲处自动保点以把几何误差限制在 RESAMPLE_DEV_MM_CALLI 内。
-static float RESAMPLE_DEV_MM_CALLI = 0.06f;  // 书法段 RDP 允许的最大垂直偏差(mm)，越小越保真
+//   直段塌成两端点（一笔到底、最顺滑），弯曲/拐角自动保点 ⇒ 容差越大、点越少、停顿越少（治顿挫）。
+//   现由 config 键 rdp_tol_mm 驱动（默认 0.35；实测 0.35≈减 10% 点、0.5≈17%、0.8≈30%，真减停在 0.5~0.8）。
 static float RESAMPLE_STEP_MM_DRAW = 1.2f;   // 描边段沿用定步长抽稀（行为与修复前一致）
 
 // --------------------------- 过滤与降采样 ---------------------------
@@ -91,21 +91,31 @@ void resamplePolylineRDP(std::vector<Point>& pts, float tolMm) {
 }
 
 // —— 节奏估时 —— //
+// 计时 v 只按【落笔/抬笔】选，不再查速度档：速度档现在【只】决定发给设备的字节(=设备快慢)，与软件节拍无关。
+//   落笔 28mm/s：真机分桶实测"已知干净"的碎段计时常数（档1剖面 d/28+C 逐桶吻合；v_req∈[28,42)）。
+//   抬笔 128mm/s：抬笔段无墨、截断不可见 ⇒ 走快，抬笔走行/锚点等待大幅缩短（整行 −40%）。
+// ⚠ 28/128 是"每点该给多少时间"的计时常数，不是设备巡航速度，禁止填 320mm 预览线实测巡航值(415~1185)。
+static const float PEN_DOWN_MM_PER_SEC = 28.0f;
+static const float PEN_UP_MM_PER_SEC   = 128.0f;
+
+// 兼容保留：书写计时已改走 isPenDown、不再调用本函数；仅留给"按 level 取字节语义"的旧引用。
 float speedLevelToXYmmPerSec(int level) {
-    static const float table_normal[7] = { 0,40,60,80,110,140,180 };
-    static const float table_quality[7] = { 0,28,42,56,80,100,128 };
     level = std::max(SPEED_MIN, std::min(SPEED_MAX, level));
-    return g_highQuality ? table_quality[level] : table_normal[level];
+    return (level >= SPEED_MAX) ? 128.0f : 28.0f;
 }
-int get_Z_SETTLE_MS(bool isCalli) { return (!g_enableDunbi) ? 0 : ((g_highQuality && isCalli) ? 160 : g_z_settle_ms); }
-int get_STROKE_BEGIN_DWELL_MS(bool isCalli) { return (!g_enableDunbi) ? 0 : ((g_highQuality && isCalli) ? 110 : g_stroke_begin_ms); }
-int get_STROKE_END_DWELL_MS(bool isCalli) { return (!g_enableDunbi) ? 0 : ((g_highQuality && isCalli) ? 120 : g_stroke_end_ms); }
+// Phase 1：把「到位时间」从「顿笔开关 / high_quality」解耦——三个 dwell 只读 config。
+// 旧实现：!g_enableDunbi 先把 dwell 短路成 0（关顿笔→端点无时间→纯 Z 落笔/抬笔被串口地板卡住→笔画收尾/短笔截断）；
+//         g_highQuality && isCalli 又硬编码 160/110/120 覆盖 config（→改 config 三键无效）。
+// 现在：顿笔开关只管 hanzi.cpp 的分层下刀/深度，不再管时间；高质档不再自动改 dwell（要更慢更稳就把 config 三键调大）。
+int get_Z_SETTLE_MS(bool /*isCalli*/)           { return g_z_settle_ms; }
+int get_STROKE_BEGIN_DWELL_MS(bool /*isCalli*/) { return g_stroke_begin_ms; }
+int get_STROKE_END_DWELL_MS(bool /*isCalli*/)   { return g_stroke_end_ms; }
 int get_POINT_RATE_LIMIT_MS(bool isCalli) { return (g_highQuality && isCalli) ? 90 : POINT_RATE_LIMIT_MS_BASE; }
 
 // 方案A：返回相邻两条指令的“目标间隔”（运动时间 + 必要的物理停顿），
 // 不再是“发完后再额外 sleep 的时长”。串口往返与运动本身占用的墙钟时间由调用方补偿扣除。
 int estimateMoveMs(const Point& prev, const Point& cur, bool isCalli) {
-    float vx = speedLevelToXYmmPerSec(cur.speed);
+    float vx = cur.isPenDown ? PEN_DOWN_MM_PER_SEC : PEN_UP_MM_PER_SEC;   // 计时只按落/抬笔，不查速度档
     float dx = cur.x - prev.x, dy = cur.y - prev.y;
     float dxy = std::sqrt(dx * dx + dy * dy);
     int t_xy = (vx > 1e-3f) ? int(std::ceil(dxy / vx * 1000.f)) : 0;
@@ -115,10 +125,15 @@ int estimateMoveMs(const Point& prev, const Point& cur, bool isCalli) {
     int extra = 0;
     if (!zDownPrev && zDownNow) extra += get_STROKE_BEGIN_DWELL_MS(isCalli);
     if (zDownPrev && !zDownNow) extra += get_STROKE_END_DWELL_MS(isCalli);
+    // ★Z 过渡点(dxy≈0)的总预算 = base + z_settle = C + z_settle。要保住 Phase 1 验证过的 ~107ms
+    //   落笔静压(不炸毛)，config 的 z_settle_ms 必须取 107 - C（C=80 → 27）。别留旧值 95（会变 175ms）。
     if (std::fabs(cur.z - prev.z) > 1.0f) extra += get_Z_SETTLE_MS(isCalli);
 
-    // 目标间隔 = max(最小节拍, 运动时间) + 物理停顿；不再叠加旧的 60ms 走停地板。
-    int base = std::max(g_min_point_interval_ms, t_xy);
+    // 目标间隔 = max(最小节拍, 运动时间 + 每点固定开销 C) + 物理停顿 extra。
+    // C 按落笔段类型分两组：直线段(横/竖)=g_point_fixed_ms、曲线段(撇/捺/弯钩)=g_point_fixed_curve_ms。
+    // （strokeKind 由 transmitTrajectoryWithSplit 的两段式 RDP 分类打标。）
+    int Cfix = (cur.isPenDown && cur.strokeKind == 1) ? g_point_fixed_curve_ms : g_point_fixed_ms;
+    int base = std::max(g_min_point_interval_ms, t_xy + Cfix);
     return base + extra;
 }
 
@@ -168,7 +183,22 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
             size_t j = i;
             std::vector<Point> seg;
             for (; j < end && filtered[j].isPenDown == pen; ++j) seg.push_back(filtered[j]);
-            if (pen) { if (adaptive) resamplePolylineRDP(seg, param); else resamplePolyline(seg, param); }
+            if (pen && adaptive) {
+                // 两段式分类：先按【直线容差】RDP。塌到 ≤2 点 ⇒ 直线段(横/竖)，直接用；
+                // 否则 ⇒ 曲线段(撇/捺/弯钩)，对【原始 seg】按【曲线容差】重算(保形)。
+                std::vector<Point> probe = seg;
+                resamplePolylineRDP(probe, g_rdp_tol_mm);
+                if (probe.size() <= 2) {
+                    seg = probe;
+                    for (auto& p : seg) p.strokeKind = 0;
+                } else {
+                    resamplePolylineRDP(seg, g_rdp_tol_curve_mm);
+                    for (auto& p : seg) p.strokeKind = 1;
+                }
+            } else if (pen) {
+                resamplePolyline(seg, param);   // 描边段定步长
+                for (auto& p : seg) p.strokeKind = 0;
+            }
             out.insert(out.end(), seg.begin(), seg.end());
             i = j;
         }
@@ -182,7 +212,7 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
     //        否则混合轨迹（前段书法+后段描边）会发生分界错位。
     calli_end = (size_t)(std::lower_bound(srcIdx.begin(), srcIdx.end(), calli_end) - srcIdx.begin());
     calli_end = std::min(calli_end, filtered.size());
-    if (calli_end > 0) calli_end = resample_range(0, calli_end, true, RESAMPLE_DEV_MM_CALLI);
+    if (calli_end > 0) calli_end = resample_range(0, calli_end, true, g_rdp_tol_mm);
     if (calli_end < filtered.size()) resample_range(calli_end, filtered.size(), false, RESAMPLE_STEP_MM_DRAW);
 
     const float corner_theta_rad = 75.0f * 3.1415926f / 180.0f;
@@ -275,9 +305,22 @@ bool transmitTrajectoryWithSplit(SerialPort& sp, const std::vector<Point>& traj,
                 // 角点额外停顿：折进本点指令间隔（补偿式，不再叠加在串口耗时之上）
                 int corner_extra = 0;
                 if (k >= 1 && k + 1 < j) {
-                    float ang = angle_between(filtered[k - 1], filtered[k], filtered[k + 1]);
-                    if (ang > corner_theta_rad) corner_extra = hard_corner_ms;
-                    else if (ang > corner_theta_rad * 0.6f) corner_extra = corner_dwell_ms;
+                    // angle_between 返回【内角】：直段续接=π(180°)、真拐角=π/2、发夹≈0。
+                    // 旧判据 ang>θ 会把 +停顿打在【直线点】上(100% 命中)、反而漏掉真发夹——逻辑反了。
+                    // 正确：用【转折角】turn = π - ang，只在方向真的改变处停顿。（此停顿与 estimateMoveMs 的 C 同批引入）
+                    // R5：退化角修正——每个笔画的下降点 down@p0 的前一点是同 XY 的抬笔点 UP@p0，
+                    // |Δxy|≈0 使 angle_between 返回 0 ⇒ turn=π 被误判成硬拐角 ⇒ 每个起笔白拿 +80ms
+                    // （起笔静压≈340ms、墨团偏大）。仅当前后两段 XY 都足够长(>0.5mm)时才计算转角。
+                    float px = filtered[k].x - filtered[k - 1].x, py = filtered[k].y - filtered[k - 1].y;
+                    float nx = filtered[k + 1].x - filtered[k].x, ny = filtered[k + 1].y - filtered[k].y;
+                    float len_prev = std::sqrt(px * px + py * py);
+                    float len_next = std::sqrt(nx * nx + ny * ny);
+                    if (len_prev > 0.5f && len_next > 0.5f) {
+                        float ang = angle_between(filtered[k - 1], filtered[k], filtered[k + 1]);
+                        float turn = 3.1415926f - ang;
+                        if (turn > corner_theta_rad) corner_extra = hard_corner_ms;
+                        else if (turn > corner_theta_rad * 0.6f) corner_extra = corner_dwell_ms;
+                    }
                 }
 
                 wait_after_send(t0, interval_for(lastSent, p, true, corner_extra));
@@ -378,8 +421,8 @@ bool move_up_to_and_wait(SerialPort& sp, const Point& targetUp, bool isCalli) {
     up.zType = "UP-PREPOS";
     if (!sp.sendPointRetry(up)) return false;
 
-    // 2) 估算到位时间：若没有历史pose，就按 0,0,UP 估
-    float vx = speedLevelToXYmmPerSec(up.speed);
+    // 2) 估算到位时间：抬笔预定位 → 用抬笔计时常数（更快），不再查 level
+    float vx = PEN_UP_MM_PER_SEC;
     float dx = up.x - prev.x, dy = up.y - prev.y;
     float dxy = std::sqrt(dx * dx + dy * dy);
     int t_xy = (vx > 1e-3f) ? int(std::ceil(dxy / vx * 1000.f)) : 0;
