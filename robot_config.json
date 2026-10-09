@@ -1,5 +1,6 @@
 {
   "auto_draw": false,
+  "ble_addr": "21F6473AD889",
   "center": [
     0.0,
     0.0,
@@ -69,6 +70,9 @@
   "page_count": 2,
   "page_text": "溪来",
   "page_text_full": "溪来",
+  "page_turn_ble": true,
+  "page_turn_gear": 15,
+  "page_turn_run_ms": 3000,
   "page_turn_wait_ms": 3000,
   "point_fixed_curve_ms": 25,
   "point_fixed_ms": 85,

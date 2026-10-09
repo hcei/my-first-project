@@ -279,6 +279,35 @@ static void menu_generate_shanshui() {
     }
 }
 
+// ★输入失败的统一处理（2026-09-24 修复“非控制台 stdin 下主循环空转刷日志”）
+//   背景：stdin 被重定向/关闭时 std::cin 立即返回 EOF。此前失败分支一律
+//   clear + ignore + continue，而 ignore 在 EOF 上什么都吃不到，于是 while(true)
+//   无任何延时地空转：实测 12 秒重打印近万遍菜单、写出 15MB 日志
+//   （2026-09-18 另两次各 10~13MB）。
+//   返回 true = 调用方应立即退出循环；false = 已清错，可继续下一次读取。
+static int s_badInputStreak = 0;
+static const int BAD_INPUT_LIMIT = 1000;
+static bool input_fail_should_exit(const wchar_t* where) {
+    if (std::cin.eof()) {
+        std::wstringstream ws;
+        ws << L"[提示] 输入流已结束（stdin 被关闭/重定向，位置：" << where
+           << L"）：为避免空转刷日志，程序退出。";
+        wprintln(ws.str());
+        return true;
+    }
+    std::cin.clear();
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    if (++s_badInputStreak > BAD_INPUT_LIMIT) {
+        std::wstringstream ws;
+        ws << L"[提示] 连续 " << BAD_INPUT_LIMIT << L" 次无效输入（位置：" << where
+           << L"），疑似输入源异常，程序退出。";
+        wprintln(ws.str());
+        return true;
+    }
+    wprintln(L"[提示] 无效输入。");
+    return false;
+}
+
 static void print_menu() {
     wprintln(L"================= 毛笔书写 + 2D 描边 控制台 =================");
     wprintln(L"1. 写字并自动 2D 描边（上方写字，下方作画：自动读取 themes/ 最新 JSON）");
@@ -562,7 +591,9 @@ static void menu_debug(SerialPort& sp) {
         wprintln(L"0. 返回主菜单");
         wprintln(L"调试选择(0-8) / Select：");
         int sel = 0;
-        if (!(std::cin >> sel)) { std::cin.clear(); std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); wprintln(L"[提示] 无效输入。"); continue; }
+        // ★输入失败：EOF / 连续无效过多 -> 退出循环（此前 continue 会空转刷日志）
+        if (!(std::cin >> sel)) { if (input_fail_should_exit(L"调试菜单")) break; continue; }
+        s_badInputStreak = 0;
         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
         if (sel == 0) break;
         else if (sel == 1) dbg_single_point(sp);
@@ -623,7 +654,9 @@ int main(int argc, char** argv) {
     while (true) {
         print_menu();
         int sel = 0;
-        if (!(std::cin >> sel)) { std::cin.clear(); std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n'); wprintln(L"[提示] 无效输入。"); continue; }
+        // ★输入失败：EOF（stdin 关闭/重定向）或连续无效过多 -> 退出，避免空转刷日志
+        if (!(std::cin >> sel)) { if (input_fail_should_exit(L"主菜单")) break; continue; }
+        s_badInputStreak = 0;
         std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
         if (sel == 1) {

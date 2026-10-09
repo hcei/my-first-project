@@ -80,6 +80,12 @@ float g_rdp_tol_curve_mm    = RDP_TOL_CURVE_MM_BASE;     // 0.15 曲线段 RDP �
 
 static FILE* g_logFile = nullptr;
 
+// ★日志体积安全阀（2026-09-24 加）：单文件上限，超过即停止记录并在日志里写明原因。
+//   背景：主程序在 stdin 非控制台（EOF）时空转，12 秒写出 15MB 日志；
+//   加此上限后，任何刷屏来源都不会再把磁盘写爆。
+static const long LOG_MAX_BYTES = 8L * 1024 * 1024;   // 8MB
+static bool       g_logCapped   = false;
+
 // ★设备 Z 行程校验（按实测范围，config 可调）
 bool inZRange(float z) { return z >= g_z_bottom && z <= g_z_top; }
 
@@ -93,18 +99,24 @@ void log_init() {
     std::snprintf(buf, sizeof(buf), "logs/Robot_%04d%02d%02d_%02d%02d%02d.log",
         tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     g_logPath = buf;
+    g_logCapped = false;   // ★每次运行重置上限标志
     g_logFile = std::fopen(g_logPath.c_str(), "a");
     if (g_logFile) {
-        std::fprintf(g_logFile, "==== Robot 运行日志 %04d-%02d-%02d %02d:%02d:%02d ====\n",
+        // ★编码修正（2026-09-24）：日志正文一律以 GBK 落盘；此前横幅直接写源码里的中文
+        //   （源码是 UTF-8），混进 GBK 日志后显示为乱码——这里改走 w2gbk 与正文保持一致。
+        char stamp[32];
+        std::snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d %02d:%02d:%02d",
             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+        std::fprintf(g_logFile, "%s%s%s\n",
+            w2gbk(L"==== Robot 运行日志 ").c_str(), stamp, w2gbk(L" ====").c_str());
         std::fflush(g_logFile);
     }
 }
 
 // 每条输出带毫秒时间戳写入日志（g_logEnable 关闭时跳过）
 static void log_write(const std::string& gbk_line) {
-    if (!g_logEnable || !g_logFile) return;
+    if (!g_logEnable || !g_logFile || g_logCapped) return;
     auto now = std::chrono::system_clock::now();
     std::time_t t = std::chrono::system_clock::to_time_t(now);
     std::tm tmv{};
@@ -113,6 +125,14 @@ static void log_write(const std::string& gbk_line) {
         now.time_since_epoch()).count() % 1000);
     std::fprintf(g_logFile, "[%02d:%02d:%02d.%03d] %s\n",
         tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ms, gbk_line.c_str());
+    // ★体积安全阀：达到上限就封顶（补写一条说明后本次运行不再记录）
+    if (std::ftell(g_logFile) >= LOG_MAX_BYTES) {
+        g_logCapped = true;
+        std::wstringstream ws;
+        ws << L"[日志] 已达单文件上限 " << (long)LOG_MAX_BYTES
+           << L" 字节，本次运行后续输出不再记录（防刷屏把磁盘写爆）。";
+        std::fprintf(g_logFile, "%s\n", w2gbk(ws.str()).c_str());
+    }
     std::fflush(g_logFile);
 }
 
